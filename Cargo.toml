@@ -1,0 +1,19 @@
+[package]
+name = "discord-async"
+version = "0.1.0"
+authors = ["kebabtent <kebabtent@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+async-tls = "0.7"
+async-tungstenite = { version = "0.5", features = ["async-tls", "tokio-runtime"] }
+bitflags = "1.2"
+chrono = "0.4"
+log = "0.4"
+never = "0.1"
+pin-project = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "0.2", features = ["full"] }
+tungstenite = "0.10"
+futures = "0.3"
