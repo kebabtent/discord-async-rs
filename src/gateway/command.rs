@@ -25,6 +25,13 @@ impl Command {
 		}
 	}
 
+	pub fn is_heartbeat(&self) -> bool {
+		match self {
+			Command::Heartbeat(_) => true,
+			_ => false,
+		}
+	}
+
 	pub fn heartbeat<T: Into<Heartbeat>>(heartbeat: T) -> Self {
 		Command::Heartbeat(heartbeat.into())
 	}
@@ -116,7 +123,7 @@ impl Identify {
 			intents: Some(
 				Intents::GUILD_ALL
 					^ Intents::GUILD_WEBHOOKS
-					^ Intents::GUILD_PRESENCES
+					// ^ Intents::GUILD_PRESENCES
 					^ Intents::GUILD_MESSAGE_TYPING,
 			),
 		}

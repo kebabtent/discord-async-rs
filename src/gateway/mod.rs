@@ -3,7 +3,7 @@ use async_tungstenite::tokio::{connect_async, TokioAdapter};
 use async_tungstenite::WebSocketStream;
 use futures::{Sink, Stream};
 use futures::{SinkExt, StreamExt};
-use log::{debug, info};
+use log::{debug, info, trace};
 use pin_project::pin_project;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -14,11 +14,9 @@ use tokio::net::TcpStream;
 
 mod command;
 mod encoder;
-mod event;
 
 pub use command::{Command, Intents};
 use encoder::{Encoder, JsonEncoder};
-pub use event::{Event, Payload};
 
 pub(crate) type AutoStream<S> =
 	async_tungstenite::stream::Stream<S, async_tls::client::TlsStream<S>>;
@@ -51,8 +49,8 @@ impl From<tungstenite::Error> for Error {
 	}
 }
 
-impl From<event::EventError> for Error {
-	fn from(_error: event::EventError) -> Self {
+impl From<protocol::EventError> for Error {
+	fn from(_error: protocol::EventError) -> Self {
 		Error::UnexpectedEvent
 	}
 }
@@ -202,7 +200,7 @@ pub struct Gateway {
 }
 
 impl Stream for Gateway {
-	type Item = Result<Payload, Error>;
+	type Item = Result<protocol::Payload, Error>;
 
 	fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
 		self.project().conn.poll_next(cx)
@@ -237,14 +235,18 @@ pub struct Connection {
 }
 
 impl Stream for Connection {
-	type Item = Result<Payload, Error>;
+	type Item = Result<protocol::Payload, Error>;
 
 	fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
 		let project = self.project();
 		match project.conn.poll_next(cx) {
 			Poll::Ready(Some(Ok(message))) => match project.encoder.decode(message) {
 				Ok(p) => {
-					debug!("RECV {}", p);
+					if p.event.is_heartbeat_ack() {
+						trace!("RECV {}", p);
+					} else {
+						debug!("RECV {}", p);
+					}
 					Poll::Ready(Some(Ok(p)))
 				}
 				Err(e) => Poll::Ready(Some(Err(e))),
@@ -264,7 +266,11 @@ impl Sink<Command> for Connection {
 	}
 
 	fn start_send(self: Pin<&mut Self>, item: Command) -> Result<(), Self::Error> {
-		debug!("SEND {}", item);
+		if item.is_heartbeat() {
+			trace!("SEND {}", item);
+		} else {
+			debug!("SEND {}", item);
+		}
 		let project = self.project();
 		let message = project.encoder.encode(item);
 		project.conn.start_send(message).map_err(|e| e.into())

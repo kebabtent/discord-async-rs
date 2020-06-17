@@ -1,5 +1,6 @@
 use super::super::{Command, Error};
-use super::{event, Encoder};
+use super::Encoder;
+use crate::protocol;
 use log::warn;
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
@@ -49,20 +50,20 @@ impl JsonEncoder {
 impl Encoder for JsonEncoder {
 	fn encode(&mut self, command: Command) -> Message {
 		let payload = Payload::new(&command);
-		// let v = serde_json::to_value(&payload).unwrap();
-		// debug!("OUT: {:#?}", v);
 		Message::Text(serde_json::to_string(&payload).unwrap())
 	}
 
-	fn decode(&mut self, message: Message) -> Result<event::Payload, Error> {
+	fn decode(&mut self, message: Message) -> Result<protocol::Payload, Error> {
 		match message {
 			Message::Text(s) => {
-				self.file.write_all(s.as_bytes()).unwrap();
-				self.file.write_all("\n".as_bytes()).unwrap();
-				self.file.sync_all().unwrap();
-				// let v = serde_json::Value::from_str(&s).unwrap();
-				// println!("IN: {:#?}", v);
-				serde_json::from_str(&s).map_err(|e| Error::DecodeJson(e))
+				let p: protocol::Payload =
+					serde_json::from_str(&s).map_err(|e| Error::DecodeJson(e))?;
+				if !p.event.is_heartbeat_ack() {
+					self.file.write_all(s.as_bytes()).unwrap();
+					self.file.write_all("\n".as_bytes()).unwrap();
+					self.file.sync_all().unwrap();
+				}
+				Ok(p)
 			}
 			Message::Close(frame) => Err(Error::Close(frame)),
 			m => {
