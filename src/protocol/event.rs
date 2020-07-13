@@ -185,6 +185,7 @@ pub enum Event {
 impl Event {
 	pub fn guild_id(&self) -> Option<Snowflake> {
 		match self {
+			Event::GuildCreate(_) => None,
 			Event::MessageCreate(e) => e.message.guild_id,
 			Event::MessageDelete(e) => e.guild_id,
 			Event::MessageDeleteBulk(e) => e.guild_id,
@@ -364,14 +365,6 @@ impl GuildList {
 		}
 	}
 
-	fn len(&self) -> usize {
-		self.inner.len()
-	}
-
-	fn contains(&self, value: Snowflake) -> bool {
-		self.inner.contains(&value)
-	}
-
 	fn insert(&mut self, id: Snowflake) -> bool {
 		self.inner.insert(id)
 	}
@@ -459,10 +452,12 @@ impl TryFrom<User> for types::User {
 
 	fn try_from(u: User) -> Result<Self, Self::Error> {
 		Ok(Self {
-			id: u.id,
+			id: u.id.into(),
 			username: u.username,
 			discriminator: u.discriminator,
 			avatar: u.avatar,
+			bot: u.bot.unwrap_or(false),
+			system: u.system.unwrap_or(false),
 		})
 	}
 }
@@ -499,8 +494,8 @@ impl TryFrom<Member> for types::Member {
 		Ok(Self {
 			user: m.user.try_into()?,
 			nickname: m.nick,
-			roles: m.roles.into_iter().collect(),
-			hoisted_role: m.hoisted_role,
+			roles: m.roles.into_iter().map(|r| r.into()).collect(),
+			hoisted_role: m.hoisted_role.map(|r| r.into()),
 			joined_at: m
 				.joined_at
 				.parse()
@@ -562,7 +557,7 @@ pub struct Role {
 impl From<Role> for types::Role {
 	fn from(r: Role) -> Self {
 		Self {
-			id: r.id,
+			id: r.id.into(),
 			name: r.name,
 			color: r.color,
 			hoist: r.hoist,
@@ -610,11 +605,11 @@ impl TryFrom<(Message, Snowflake)> for types::Message {
 	type Error = ProtocolError;
 
 	fn try_from(m: (Message, Snowflake)) -> Result<Self, Self::Error> {
-		let (m, member_id) = m;
+		let (m, user_id) = m;
 		Ok(Self {
-			id: m.id,
-			channel_id: m.channel_id,
-			member_id,
+			id: m.id.into(),
+			channel_id: m.channel_id.into(),
+			user_id: user_id.into(),
 			content: m.content,
 			timestamp: m
 				.timestamp
@@ -627,8 +622,12 @@ impl TryFrom<(Message, Snowflake)> for types::Message {
 				.map_err(|_| ProtocolError::InvalidField("message edited timestamp"))?,
 			tts: m.tts,
 			mention_everyone: m.mention_everyone,
-			mentions: m.mentions.into_iter().map(|m| m.id).collect(),
-			mention_channels: m.mention_channels.into_iter().map(|m| m.id).collect(),
+			mentions: m.mentions.into_iter().map(|m| m.id.into()).collect(),
+			mention_channels: m
+				.mention_channels
+				.into_iter()
+				.map(|m| m.id.into())
+				.collect(),
 			pinned: m.pinned,
 		})
 	}
@@ -739,7 +738,7 @@ impl TryFrom<Channel> for types::Channel {
 
 	fn try_from(c: Channel) -> Result<Self, Self::Error> {
 		Ok(Self {
-			id: c.id,
+			id: c.id.into(),
 			channel_type: c.channel_type,
 			position: c.position,
 			name: c
@@ -750,7 +749,7 @@ impl TryFrom<Channel> for types::Channel {
 			bitrate: c.bitrate,
 			user_limit: c.user_limit,
 			rate_limit_per_user: c.rate_limit_per_user.filter(|l| *l > 0),
-			parent_id: c.parent_id,
+			parent_id: c.parent_id.map(|p| p.into()),
 		})
 	}
 }
@@ -878,6 +877,12 @@ pub struct GuildMemberUpdate {
 	pub nick: Option<String>,
 	#[serde(default)]
 	pub premium_since: Option<String>,
+}
+
+impl GuildMemberUpdate {
+	pub fn roles(&self) -> HashSet<types::RoleId> {
+		self.roles.iter().map(|r| r.into()).collect()
+	}
 }
 
 #[derive(Debug, Deserialize)]

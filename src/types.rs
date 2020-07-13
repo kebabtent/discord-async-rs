@@ -1,70 +1,120 @@
 use crate::{protocol, Snowflake};
 use chrono::{DateTime, Utc};
 use either::Either;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
+use std::ops::Deref;
 
 pub type ChannelType = protocol::ChannelType;
+
+// Separate type for each id so we can't confuse them
+// Just a thin wrapper around a Snowflake with appropriate trait impls
+macro_rules! id_type {
+	($t:ident) => {
+		#[derive(
+			Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+		)]
+		pub struct $t(Snowflake);
+
+		impl fmt::Display for $t {
+			fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+				fmt::Display::fmt(&self.0, f)
+			}
+		}
+
+		impl From<Snowflake> for $t {
+			fn from(id: Snowflake) -> Self {
+				$t(id)
+			}
+		}
+
+		impl From<&Snowflake> for $t {
+			fn from(id: &Snowflake) -> Self {
+				$t(*id)
+			}
+		}
+
+		impl From<u64> for $t {
+			fn from(id: u64) -> Self {
+				$t(Snowflake::from(id))
+			}
+		}
+
+		impl PartialEq<u64> for $t {
+			fn eq(&self, other: &u64) -> bool {
+				PartialEq::eq(&self.0, other)
+			}
+		}
+
+		impl Deref for $t {
+			type Target = Snowflake;
+
+			fn deref(&self) -> &Self::Target {
+				&self.0
+			}
+		}
+	};
+}
+
+id_type!(UserId);
+id_type!(ChannelId);
+id_type!(RoleId);
+id_type!(MessageId);
+
+pub trait Updatable<T> {
+	fn update(&mut self, src: T);
+}
+
+pub trait CanUpdate<T> {
+	fn update_dest(self, dest: &mut T);
+}
+
+impl<T> Updatable<T> for T {
+	fn update(&mut self, src: T) {
+		std::mem::replace(self, src);
+	}
+}
+
+impl<T, U> CanUpdate<U> for T
+where
+	U: Updatable<T>,
+{
+	fn update_dest(self, dest: &mut U) {
+		dest.update(self)
+	}
+}
+
+pub trait HasId {
+	type Id;
+	fn id(&self) -> Self::Id;
+}
 
 #[derive(Debug)]
 pub enum Event {
 	GuildOnline,
 	GuildOffline,
 	MessageCreate(Message),
-	MessageDelete {
-		id: Snowflake,
-		channel_id: Snowflake,
-	},
-	MessageDeleteBulk {
-		ids: HashSet<Snowflake>,
-		channel_id: Snowflake,
-	},
+	MessageDelete(MessageId, ChannelId),
+	MessageDeleteBulk(HashSet<MessageId>, ChannelId),
 	MessageUpdate(Message),
-	MemberJoin(Snowflake),
+	MemberJoin(UserId),
 	MemberLeave(Either<Member, User>),
-	MemberChangeNickname {
-		id: Snowflake,
-		old_nickname: Option<String>,
-	},
-	MemberChangeUsername {
-		id: Snowflake,
-		old_username: String,
-		old_discriminator: String,
-	},
-	MemberChangeAvatar {
-		id: Snowflake,
-		old_avatar: Option<String>,
-	},
-	MemberChangePremium {
-		id: Snowflake,
-		old_premium_since: Option<DateTime<Utc>>,
-	},
-	MemberAddRole {
-		user_id: Snowflake,
-		role_id: Snowflake,
-	},
-	MemberRemoveRole {
-		user_id: Snowflake,
-		role_id: Snowflake,
-	},
+	MemberChangeNickname(UserId, Option<String>),
+	MemberChangeUsername(UserId, String, String),
+	MemberChangeAvatar(UserId, Option<String>),
+	MemberChangePremium(UserId, Option<DateTime<Utc>>),
+	MemberAddRole(UserId, RoleId),
+	MemberRemoveRole(UserId, RoleId),
 	MemberUpdate(protocol::GuildMemberUpdate),
-	RoleCreate(Snowflake),
-	RoleDelete(Snowflake, Option<Role>),
-	RoleUpdate(Snowflake, Option<Role>),
-	ChannelCreate(Snowflake),
-	ChannelDelete(Snowflake, Option<Channel>),
-	ChannelUpdate(Snowflake, Option<Channel>),
-	ReactionAdd {
-		user_id: Snowflake,
-		channel_id: Snowflake,
-		message_id: Snowflake,
-		emoji: ReactionEmoji,
-	},
-	ReactionRemove {
-		channel_id: Snowflake,
-		message_id: Snowflake,
-		remove_type: ReactionRemoveType,
-	},
+	RoleCreate(RoleId),
+	RoleDelete(RoleId, Option<Role>),
+	RoleUpdate(RoleId, Option<Role>),
+	ChannelCreate(ChannelId),
+	ChannelDelete(ChannelId, Option<Channel>),
+	ChannelUpdate(ChannelId, Option<Channel>),
+	ReactionAdd(UserId, ChannelId, MessageId, ReactionEmoji),
+	ReactionRemove(ChannelId, MessageId, ReactionRemoveType),
 	Other(protocol::Event),
 }
 
@@ -77,39 +127,36 @@ pub struct ReactionEmoji {
 #[derive(Debug)]
 pub enum ReactionRemoveType {
 	All,
-	Single {
-		user_id: Snowflake,
-		emoji: ReactionEmoji,
-	},
+	Single(UserId, ReactionEmoji),
 	Emoji(ReactionEmoji),
 }
 
 #[derive(Debug)]
 pub struct Message {
-	pub(crate) id: Snowflake,
-	pub(crate) channel_id: Snowflake,
-	pub(crate) member_id: Snowflake,
+	pub(crate) id: MessageId,
+	pub(crate) channel_id: ChannelId,
+	pub(crate) user_id: UserId,
 	pub(crate) content: String,
 	pub(crate) timestamp: DateTime<Utc>,
 	pub(crate) edited_timestamp: Option<DateTime<Utc>>,
 	pub(crate) tts: bool,
 	pub(crate) mention_everyone: bool,
-	pub(crate) mentions: HashSet<Snowflake>,
-	pub(crate) mention_channels: HashSet<Snowflake>,
+	pub(crate) mentions: HashSet<UserId>,
+	pub(crate) mention_channels: HashSet<ChannelId>,
 	pub(crate) pinned: bool,
 }
 
 impl Message {
-	pub fn id(&self) -> Snowflake {
+	pub fn id(&self) -> MessageId {
 		self.id
 	}
 
-	pub fn channel_id(&self) -> Snowflake {
+	pub fn channel_id(&self) -> ChannelId {
 		self.channel_id
 	}
 
-	pub fn member_id(&self) -> Snowflake {
-		self.member_id
+	pub fn user_id(&self) -> UserId {
+		self.user_id
 	}
 
 	pub fn content(&self) -> &str {
@@ -132,11 +179,11 @@ impl Message {
 		self.mention_everyone
 	}
 
-	pub fn mentions(&self) -> &HashSet<Snowflake> {
+	pub fn mentions(&self) -> &HashSet<UserId> {
 		&self.mentions
 	}
 
-	pub fn mention_channels(&self) -> &HashSet<Snowflake> {
+	pub fn mention_channels(&self) -> &HashSet<ChannelId> {
 		&self.mention_channels
 	}
 
@@ -151,16 +198,42 @@ impl fmt::Display for Message {
 	}
 }
 
+impl From<&Message> for MessageId {
+	fn from(m: &Message) -> Self {
+		m.id
+	}
+}
+
+impl From<&Message> for ChannelId {
+	fn from(m: &Message) -> Self {
+		m.channel_id
+	}
+}
+
+impl From<&Message> for (ChannelId, MessageId) {
+	fn from(m: &Message) -> Self {
+		(m.channel_id.into(), m.id.into())
+	}
+}
+
+impl From<&Message> for UserId {
+	fn from(m: &Message) -> Self {
+		m.user_id
+	}
+}
+
 #[derive(Debug)]
 pub struct User {
-	pub(crate) id: Snowflake,
+	pub(crate) id: UserId,
 	pub(crate) username: String,
 	pub(crate) discriminator: String,
 	pub(crate) avatar: Option<String>,
+	pub(crate) bot: bool,
+	pub(crate) system: bool,
 }
 
 impl User {
-	pub fn id(&self) -> Snowflake {
+	pub fn id(&self) -> UserId {
 		self.id
 	}
 
@@ -175,6 +248,14 @@ impl User {
 	pub fn avatar(&self) -> Option<&str> {
 		self.avatar.as_deref()
 	}
+
+	pub fn is_bot(&self) -> bool {
+		self.bot
+	}
+
+	pub fn is_system(&self) -> bool {
+		self.system
+	}
 }
 
 impl fmt::Display for User {
@@ -183,12 +264,18 @@ impl fmt::Display for User {
 	}
 }
 
+impl From<&User> for UserId {
+	fn from(u: &User) -> Self {
+		u.id
+	}
+}
+
 #[derive(Debug)]
 pub struct Member {
 	pub(crate) user: User,
 	pub(crate) nickname: Option<String>,
-	pub(crate) roles: HashSet<Snowflake>,
-	pub(crate) hoisted_role: Option<Snowflake>,
+	pub(crate) roles: HashSet<RoleId>,
+	pub(crate) hoisted_role: Option<RoleId>,
 	pub(crate) joined_at: DateTime<Utc>,
 	pub(crate) premium_since: Option<DateTime<Utc>>,
 	pub(crate) mute: bool,
@@ -204,11 +291,11 @@ impl Member {
 		self.nickname.as_deref()
 	}
 
-	pub fn roles(&self) -> &HashSet<Snowflake> {
+	pub fn roles(&self) -> &HashSet<RoleId> {
 		&self.roles
 	}
 
-	pub fn hoisted_role(&self) -> Option<Snowflake> {
+	pub fn hoisted_role(&self) -> Option<RoleId> {
 		self.hoisted_role
 	}
 
@@ -227,6 +314,10 @@ impl Member {
 	pub fn is_deafened(&self) -> bool {
 		self.deaf
 	}
+
+	pub fn mention(&self) -> String {
+		format!("<@!{}>", self.user.id)
+	}
 }
 
 impl fmt::Display for Member {
@@ -238,9 +329,15 @@ impl fmt::Display for Member {
 	}
 }
 
+impl From<&Member> for UserId {
+	fn from(m: &Member) -> Self {
+		m.user.id
+	}
+}
+
 #[derive(Debug)]
 pub struct Role {
-	pub(crate) id: Snowflake,
+	pub(crate) id: RoleId,
 	pub(crate) name: String,
 	pub(crate) color: u32,
 	pub(crate) hoist: bool,
@@ -251,7 +348,7 @@ pub struct Role {
 }
 
 impl Role {
-	pub fn id(&self) -> Snowflake {
+	pub fn id(&self) -> RoleId {
 		self.id
 	}
 
@@ -284,9 +381,21 @@ impl Role {
 	}
 }
 
+impl fmt::Display for Role {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		fmt::Display::fmt(&self.name, f)
+	}
+}
+
+impl From<&Role> for RoleId {
+	fn from(r: &Role) -> Self {
+		r.id
+	}
+}
+
 #[derive(Debug)]
 pub struct Channel {
-	pub(crate) id: Snowflake,
+	pub(crate) id: ChannelId,
 	pub(crate) channel_type: ChannelType,
 	pub(crate) position: Option<u16>,
 	pub(crate) name: String,
@@ -295,11 +404,11 @@ pub struct Channel {
 	pub(crate) bitrate: Option<u32>,
 	pub(crate) user_limit: Option<u16>,
 	pub(crate) rate_limit_per_user: Option<u16>,
-	pub(crate) parent_id: Option<Snowflake>,
+	pub(crate) parent_id: Option<ChannelId>,
 }
 
 impl Channel {
-	pub fn id(&self) -> Snowflake {
+	pub fn id(&self) -> ChannelId {
 		self.id
 	}
 
@@ -335,7 +444,7 @@ impl Channel {
 		self.rate_limit_per_user
 	}
 
-	pub fn parent_id(&self) -> Option<Snowflake> {
+	pub fn parent_id(&self) -> Option<ChannelId> {
 		self.parent_id
 	}
 }
@@ -343,5 +452,18 @@ impl Channel {
 impl fmt::Display for Channel {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		fmt::Display::fmt(&self.name, f)
+	}
+}
+
+impl HasId for Channel {
+	type Id = ChannelId;
+	fn id(&self) -> Self::Id {
+		self.id
+	}
+}
+
+impl From<&Channel> for ChannelId {
+	fn from(c: &Channel) -> Self {
+		c.id
 	}
 }

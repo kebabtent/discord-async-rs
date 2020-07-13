@@ -4,8 +4,8 @@ use crate::protocol;
 use log::warn;
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
-use std::fs;
-use std::io::Write;
+// use std::fs;
+// use std::io::Write;
 use tungstenite::Message;
 
 #[derive(Debug)]
@@ -32,17 +32,17 @@ impl<'a> Serialize for Payload<'a> {
 }
 
 pub struct JsonEncoder {
-	file: fs::File,
+	// file: fs::File,
 }
 
 impl JsonEncoder {
 	pub fn new() -> Self {
 		Self {
-			file: fs::OpenOptions::new()
+			/*file: fs::OpenOptions::new()
 				.create(true)
 				.append(true)
 				.open("events.log")
-				.unwrap(),
+				.unwrap(),*/
 		}
 	}
 }
@@ -58,11 +58,11 @@ impl Encoder for JsonEncoder {
 			Message::Text(s) => {
 				let p: protocol::Payload =
 					serde_json::from_str(&s).map_err(|e| Error::DecodeJson(e))?;
-				if !p.event.is_heartbeat_ack() {
+				/*if !p.event.is_heartbeat_ack() {
 					self.file.write_all(s.as_bytes()).unwrap();
 					self.file.write_all("\n".as_bytes()).unwrap();
 					self.file.sync_all().unwrap();
-				}
+				}*/
 				Ok(p)
 			}
 			Message::Close(frame) => Err(Error::Close(frame)),
@@ -124,7 +124,5 @@ mod tests {
 		let mut it = ready.guilds.into_iter();
 		assert_eq!(it.next(), Some(&Snowflake::from(191_300_962_226_790_300)));
 		assert_eq!(it.next(), None);
-
-		// Guild create
 	}
 }

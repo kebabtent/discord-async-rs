@@ -1,26 +1,33 @@
 use self::gateway::Command;
 use chrono::prelude::{DateTime, Utc};
 use chrono::TimeZone;
-pub use discord::{Builder, Discord};
-pub use gateway::{Connector, Error, Gateway};
+pub use client::Client;
+pub use discord::{Builder, Discord, Error};
+use futures::channel::mpsc;
+pub use gateway::{Connector, Gateway};
 pub use guild::{Guild, GuildSeed};
 pub use protocol::ProtocolError;
 use serde::de::{Unexpected, Visitor};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
+use std::num::ParseIntError;
+use std::str::FromStr;
 pub use types::Event;
 
-// mod api;
-// mod client;
+pub mod api;
+mod client;
 mod discord;
 mod gateway;
 mod guild;
 pub mod protocol;
-mod types;
+pub mod types;
+
+pub(crate) type Send<T> = mpsc::Sender<T>;
+pub(crate) type Recv<T> = mpsc::Receiver<T>;
 
 const DISCORD_EPOCH: u64 = 1_420_070_400_000;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Snowflake(u64);
 
 impl Snowflake {
@@ -44,13 +51,27 @@ impl Snowflake {
 
 impl fmt::Display for Snowflake {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(f, "{}", self.0)
+		fmt::Display::fmt(&self.0, f)
 	}
 }
 
 impl From<u64> for Snowflake {
 	fn from(snowflake: u64) -> Self {
 		Self(snowflake)
+	}
+}
+
+impl FromStr for Snowflake {
+	type Err = ParseIntError;
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		let id = s.parse::<u64>()?;
+		Ok(id.into())
+	}
+}
+
+impl PartialEq<u64> for Snowflake {
+	fn eq(&self, other: &u64) -> bool {
+		self.0 == *other
 	}
 }
 
@@ -86,6 +107,15 @@ impl<'de> Deserialize<'de> for Snowflake {
 		}
 
 		deserializer.deserialize_any(SnowflakeVisitor)
+	}
+}
+
+impl Serialize for Snowflake {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		serializer.serialize_str(&format!("{}", self.0))
 	}
 }
 

@@ -169,7 +169,10 @@ impl<'a> Connector<'a> {
 			None
 		};
 
-		let gateway = Gateway { conn };
+		let gateway = Gateway {
+			conn,
+			finished: false,
+		};
 
 		Ok((
 			gateway,
@@ -197,13 +200,26 @@ impl fmt::Display for Encoding {
 pub struct Gateway {
 	#[pin]
 	conn: Connection,
+	finished: bool,
 }
 
+// A fused `Connection`
+// Return a `None` value forever after a single `None` or a WS error
 impl Stream for Gateway {
 	type Item = Result<protocol::Payload, Error>;
 
 	fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-		self.project().conn.poll_next(cx)
+		let project = self.project();
+		if *project.finished {
+			return Poll::Ready(None);
+		}
+
+		let res = project.conn.poll_next(cx);
+		match &res {
+			Poll::Ready(None) | Poll::Ready(Some(Err(Error::Ws(_)))) => *project.finished = true,
+			_ => {}
+		}
+		res
 	}
 }
 

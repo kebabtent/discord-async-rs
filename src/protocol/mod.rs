@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use serde_repr::{Deserialize_repr, Serialize_repr};
+use std::fmt;
 
 pub mod event;
 pub mod request;
@@ -11,6 +12,21 @@ pub use request::*;
 pub enum ProtocolError {
 	InvalidField(&'static str),
 	MissingField(&'static str),
+}
+
+impl std::error::Error for ProtocolError {
+	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+		None
+	}
+}
+
+impl fmt::Display for ProtocolError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			ProtocolError::InvalidField(e) => write!(f, "Invalid field '{}'", e),
+			ProtocolError::MissingField(e) => write!(f, "Missing field '{}'", e),
+		}
+	}
 }
 
 #[derive(Clone, Copy, Debug, Deserialize_repr, Serialize_repr)]
