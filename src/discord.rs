@@ -1,6 +1,6 @@
 use crate::guild::{GuildEvent, GuildSeed};
-use crate::{client, gateway, protocol};
-use crate::{Client, Command, Connector, Gateway, Recv, Send, Snowflake};
+use crate::{Client, Connector, Error, Gateway, GatewayError, Guild, ProtocolError, Recv, Send};
+use discord_types::{Application, ApplicationId, Command, Event, GuildId, Intents, User, UserId};
 use futures::channel::mpsc;
 use futures::stream::{self, SplitSink, SplitStream};
 use futures::{pin_mut, select};
@@ -9,74 +9,69 @@ use log::{debug, info, warn};
 use never::Never;
 use pin_project::pin_project;
 use std::collections::HashMap;
-use std::fmt;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::{task, time};
+use tokio_stream::wrappers::IntervalStream;
 
-type Guilds = HashMap<Snowflake, (bool, Option<Send<GuildEvent>>)>;
-
-#[derive(Debug)]
-pub enum Error {
-	Gateway(gateway::Error),
-	Client(client::Error),
-}
-
-impl fmt::Display for Error {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Error::Gateway(e) => write!(f, "Gateway error: {:?}", e),
-			Error::Client(e) => write!(f, "Client error: {:?}", e),
-		}
-	}
-}
-
-impl std::error::Error for Error {
-	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-		/*match self {
-			Error::Gateway(e) => Some(e),
-			Error::Client(e) => Some(e),
-		}*/
-		None
-	}
-}
-
-impl From<gateway::Error> for Error {
-	fn from(e: gateway::Error) -> Self {
-		Error::Gateway(e)
-	}
-}
-
-impl From<client::Error> for Error {
-	fn from(e: client::Error) -> Self {
-		Error::Client(e)
-	}
-}
+type Guilds = HashMap<GuildId, (bool, Option<Send<GuildEvent>>)>;
 
 pub struct Builder {
 	token: String,
+	intents: Intents,
 }
 
 impl Builder {
 	pub fn new(token: String) -> Self {
-		Self { token }
+		Self {
+			token,
+			intents: Intents::GUILD_ALL ^ Intents::GUILD_WEBHOOKS ^ Intents::GUILD_MESSAGE_TYPING,
+		}
+	}
+
+	pub fn with_webhooks(mut self) -> Self {
+		self.intents |= Intents::GUILD_WEBHOOKS;
+		self
+	}
+
+	pub fn without_presences(mut self) -> Self {
+		self.intents ^= Intents::GUILD_PRESENCES;
+		self
+	}
+
+	pub fn with_typing(mut self) -> Self {
+		self.intents |= Intents::GUILD_MESSAGE_TYPING;
+		self
+	}
+
+	pub fn with(mut self, intents: Intents) -> Self {
+		self.intents |= intents;
+		self
+	}
+
+	pub fn without(mut self, intents: Intents) -> Self {
+		self.intents ^= intents;
+		self
 	}
 
 	pub fn build(self) -> Result<Discord, Error> {
-		let (guild_send, guild_recv) = mpsc::channel(8);
+		let (seed_send, seed_recv) = mpsc::channel(8);
 		let (command_send, command_recv) = mpsc::channel(8);
-		let client = Client::new(self.token.clone())?;
+		let client = Client::new(self.token.clone(), command_send.clone())?;
 		task::spawn(start_discord(
 			self.token,
-			guild_send,
+			self.intents,
+			seed_send,
 			command_recv,
 			client.clone(),
 		));
 		Ok(Discord {
-			guild_recv,
+			user: None,
+			application: None,
+			seed_recv,
 			client,
 			command_send,
 		})
@@ -85,8 +80,10 @@ impl Builder {
 
 #[pin_project]
 pub struct Discord {
+	user: Option<User>,
+	application: Option<Application>,
 	#[pin]
-	guild_recv: Recv<GuildSeed>,
+	seed_recv: Recv<Seed>,
 	client: Client,
 	command_send: Send<Command>,
 }
@@ -95,33 +92,97 @@ impl Discord {
 	pub fn client(&self) -> Client {
 		self.client.clone()
 	}
+
+	pub fn user_id(&self) -> Option<UserId> {
+		self.user.as_ref().map(|a| a.id)
+	}
+
+	pub fn application_id(&self) -> Option<ApplicationId> {
+		self.application.as_ref().map(|a| a.id)
+	}
+
+	pub async fn seed_guild(&self, seed: GuildSeed) -> Result<Guild, Error> {
+		Guild::new(
+			seed,
+			self.user_id()
+				.ok_or_else(|| ProtocolError::MissingField("user"))?,
+			self.application_id()
+				.ok_or_else(|| ProtocolError::MissingField("application"))?,
+		)
+		.await
+	}
 }
 
 impl Stream for Discord {
 	type Item = GuildSeed;
 
-	fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-		self.project().guild_recv.poll_next(cx)
+	fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+		let mut this = self.as_mut().project();
+		loop {
+			return match this.seed_recv.as_mut().poll_next(cx) {
+				Poll::Ready(Some(Seed::Guild(guild))) => Poll::Ready(Some(guild)),
+				Poll::Ready(Some(Seed::User(user))) => {
+					if this.user.is_none() {
+						info!("User id: {}", user.id);
+						*this.user = Some(user);
+					}
+					continue;
+				}
+				Poll::Ready(Some(Seed::Application(application))) => {
+					if this.application.is_none() {
+						info!("Application id: {}", application.id);
+						*this.application = Some(application);
+					}
+					continue;
+				}
+				Poll::Ready(None) => Poll::Ready(None),
+				Poll::Pending => Poll::Pending,
+			};
+		}
+	}
+}
+
+enum Seed {
+	User(User),
+	Application(Application),
+	Guild(GuildSeed),
+}
+
+struct Meta {
+	pub session_id: Option<String>,
+	pub user: Option<User>,
+	pub application: Option<Application>,
+}
+
+impl Meta {
+	pub fn new() -> Self {
+		Self {
+			session_id: None,
+			user: None,
+			application: None,
+		}
 	}
 }
 
 async fn start_discord(
 	token: String,
-	mut guild_send: Send<GuildSeed>,
+	intents: Intents,
+	mut seed_send: Send<Seed>,
 	mut command_recv: Recv<Command>,
 	client: Client,
 ) {
 	let mut guilds = HashMap::new();
-	let mut session_id: Option<String> = None;
+	let mut meta = Meta::new();
 	let sequence = Arc::new(AtomicU64::new(0));
 
 	loop {
 		match connect(
 			&token,
-			&mut session_id,
+			intents,
+			&mut meta,
 			sequence.clone(),
 			&mut guilds,
-			&mut guild_send,
+			&mut seed_send,
 			&mut command_recv,
 			client.clone(),
 		)
@@ -131,36 +192,42 @@ async fn start_discord(
 			Err(e) => warn!("Connection error: {:?}", e),
 		}
 		for (_, send) in guilds.values_mut() {
-			// Don't mark them offline in our local hashmap so we can deal with resumes
+			// Don't mark them offline in our local map so we can deal with resumes
 			send_or_drop(send, GuildEvent::Offline);
 		}
-		time::delay_for(Duration::from_secs(3)).await; // TODO: exponential backoff?
+		time::sleep(Duration::from_secs(3)).await; // TODO: exponential backoff?
 	}
 }
 
 async fn connect(
 	token: &str,
-	session_id: &mut Option<String>,
+	intents: Intents,
+	meta: &mut Meta,
 	sequence: Arc<AtomicU64>,
 	guilds: &mut Guilds,
-	guild_send: &mut Send<GuildSeed>,
+	seed_send: &mut Send<Seed>,
 	command_recv: &mut Recv<Command>,
 	client: Client,
-) -> Result<Never, gateway::Error> {
-	let connector = match session_id.as_deref() {
-		Some(s) => Connector::resume(&token, s, sequence.load(Ordering::Relaxed)),
-		None => Connector::new(&token),
+) -> Result<Never, GatewayError> {
+	let connector = match meta.session_id.as_deref() {
+		Some(s) => Connector::resume(&token, s, sequence.load(Ordering::Relaxed), intents),
+		None => Connector::new(&token, intents),
 	};
 
 	let (gateway, heartbeat_interval, ready) = connector.connect().await?;
 	if let Some(ready) = ready {
-		*session_id = Some(ready.session_id);
+		meta.session_id = Some(ready.session_id);
+		meta.user = Some(ready.user.clone());
+		meta.application = Some(ready.application);
+
+		let _ = seed_send.send(Seed::User(ready.user)).await;
+		let _ = seed_send.send(Seed::Application(ready.application)).await;
 	}
 
 	let (writer, reader) = gateway.split();
 	let write_fut = write(writer, command_recv, sequence.clone(), heartbeat_interval).fuse();
 	pin_mut!(write_fut);
-	let read_fut = read(reader, guild_send, guilds, session_id, sequence, client).fuse();
+	let read_fut = read(reader, seed_send, guilds, meta, sequence, client).fuse();
 	pin_mut!(read_fut);
 
 	select! {
@@ -174,11 +241,11 @@ async fn write(
 	command_recv: &mut Recv<Command>,
 	sequence: Arc<AtomicU64>,
 	heartbeat_interval: Duration,
-) -> Result<Never, gateway::Error> {
-	let heartbeat = time::interval_at(
+) -> Result<Never, GatewayError> {
+	let heartbeat = IntervalStream::new(time::interval_at(
 		time::Instant::now() + heartbeat_interval,
 		heartbeat_interval,
-	)
+	))
 	.map(|_| Command::heartbeat(sequence.load(Ordering::Relaxed)));
 
 	let mut stream = stream::select(command_recv, heartbeat);
@@ -187,19 +254,20 @@ async fn write(
 	while let Some(item) = stream.next().await {
 		gateway.send(item).await?;
 	}
+	gateway.close().await?;
 
 	debug!("Writer shutdown");
-	Err(gateway::Error::Close(None))
+	Err(GatewayError::Close(None))
 }
 
 async fn read(
 	mut gateway: SplitStream<Gateway>,
-	guild_send: &mut Send<GuildSeed>,
+	seed_send: &mut Send<Seed>,
 	guilds: &mut Guilds,
-	session_id: &mut Option<String>,
+	meta: &mut Meta,
 	sequence: Arc<AtomicU64>,
 	client: Client,
-) -> Result<Never, gateway::Error> {
+) -> Result<Never, GatewayError> {
 	while let Some(event) = gateway.next().await {
 		let event = match event {
 			Ok(p) => {
@@ -208,12 +276,43 @@ async fn read(
 				}
 				p.event
 			}
-			Err(gateway::Error::Close(frame)) => return Err(gateway::Error::Close(frame)),
+			Err(GatewayError::Close(frame)) => return Err(GatewayError::Close(frame)),
 			Err(e) => {
-				warn!("Gateway error: {:?}", e);
+				warn!("Gateway error: {}", e);
 				continue;
 			}
 		};
+
+		use Event::*;
+		if let GuildCreate(gc) = &event {
+			if meta.application.is_none() {
+				warn!("Received guild before being ready");
+				break;
+			}
+
+			let guild_id = gc.guild.id;
+			let unavailable = gc.guild.unavailable.unwrap_or(true);
+
+			if !guilds.contains_key(&guild_id) {
+				// 'New' guild (not yet known)
+				let (send, recv) = mpsc::channel(16);
+				guilds.insert(guild_id, (false, Some(send)));
+				let seed = GuildSeed::new(gc.clone(), client.clone(), recv);
+				let _ = seed_send.try_send(Seed::Guild(seed));
+			}
+
+			let (available, send) = guilds.get_mut(&guild_id).unwrap();
+			if *available == unavailable {
+				// Availability toggled, notify guild
+				*available = !unavailable;
+				let event = if unavailable {
+					GuildEvent::Offline
+				} else {
+					GuildEvent::Online
+				};
+				send_or_drop(send, event);
+			}
+		}
 
 		// Dispatch guild events to the appropriate channel
 		if let Some(guild_id) = event.guild_id() {
@@ -225,37 +324,7 @@ async fn read(
 			continue;
 		}
 
-		use protocol::Event::*;
 		match event {
-			GuildCreate(gc) => {
-				let guild_id = gc.id;
-				let unavailable = gc.unavailable;
-
-				let (available, send) = if let Some((available, send)) = guilds.get_mut(&guild_id) {
-					// Existing guild, forward `GuildCreate` event
-					send_or_drop(send, gc);
-					(available, send)
-				} else {
-					// 'New' guild (not yet known)
-					let (send, recv) = mpsc::channel(16);
-					guilds.insert(guild_id, (false, Some(send)));
-					let seed = GuildSeed::new(gc, client.clone(), recv);
-					let _ = guild_send.try_send(seed);
-					let (a, s) = guilds.get_mut(&guild_id).unwrap();
-					(a, s)
-				};
-
-				if *available == unavailable {
-					// Availability toggled, notify guild
-					*available = !unavailable;
-					let event = if unavailable {
-						GuildEvent::Offline
-					} else {
-						GuildEvent::Online
-					};
-					send_or_drop(send, event);
-				}
-			}
 			Resumed => {
 				// Resume: guilds are online again
 				info!("Resumed session");
@@ -268,19 +337,21 @@ async fn read(
 			InvalidSession(_) => {
 				// Our session was invalidated, don't try to resume it during our next connection
 				warn!("Session invalidated, starting a new one..");
-				*session_id = None;
+				meta.session_id = None;
+				break;
 			}
-			HearbeatAck => {
+			HeartbeatAck => {
 				// TODO: detect dead connection
 			}
-			Unknown(_) => {}
-			Hello(_) | Ready(_) => {}
-			_ => {}
+			Ready(_) | Hello(_) => {
+				// Should not be reachable unless server breaks protocol
+			}
+			Unknown(_) | _ => {}
 		}
 	}
 
 	debug!("Reader shutdown");
-	Err(gateway::Error::Close(None))
+	Err(GatewayError::Close(None))
 }
 
 fn send_or_drop<T, U: Into<T>>(send: &mut Option<Send<T>>, item: U) {

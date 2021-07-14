@@ -1,42 +1,22 @@
-use crate::protocol::{GuildCreate, MessageType, ProtocolError};
-use crate::{protocol, types::*};
-use crate::{Client, Recv, Snowflake};
-use either::Either;
+use crate::{Client, Error, Recv};
+use discord_types::event;
+use discord_types::{
+	ApplicationCommand, ApplicationId, Channel, ChannelId, Event, GuildId, Member, Role, RoleId,
+	UserId,
+};
 use futures::StreamExt;
-use log::{info, warn};
+use log::{debug, info};
 use std::collections::HashMap;
-use std::convert::TryInto;
-use std::mem;
-
-// Macro to log and skip fallible operations
-macro_rules! t {
-	($expr:expr) => {
-		match $expr {
-			Ok(val) => val,
-			Err(e) => {
-				warn!("{:?}", e);
-				continue;
-				}
-			}
-	};
-}
-
-// Macro to try to convert one type to another
-macro_rules! ti {
-	($expr:expr) => {
-		t!($expr.try_into())
-	};
-}
 
 pub struct GuildSeed {
-	guild_create: protocol::GuildCreate,
+	guild_create: event::GuildCreate,
 	client: Client,
 	event_recv: Recv<GuildEvent>,
 }
 
 impl GuildSeed {
 	pub(crate) fn new(
-		guild_create: protocol::GuildCreate,
+		guild_create: event::GuildCreate,
 		client: Client,
 		event_recv: Recv<GuildEvent>,
 	) -> Self {
@@ -47,46 +27,58 @@ impl GuildSeed {
 		}
 	}
 
-	pub fn id(&self) -> Snowflake {
-		self.guild_create.id
+	pub fn id(&self) -> GuildId {
+		self.guild_create.guild.id
 	}
 
 	pub fn name(&self) -> &str {
-		&self.guild_create.name
+		&self.guild_create.guild.name
 	}
 
-	fn inner(self) -> (protocol::GuildCreate, Client, Recv<GuildEvent>) {
+	fn inner(self) -> (event::GuildCreate, Client, Recv<GuildEvent>) {
 		(self.guild_create, self.client, self.event_recv)
 	}
 }
 
 pub struct Guild {
-	id: Snowflake,
+	id: GuildId,
+	user_id: UserId,
+	application_id: ApplicationId,
 	name: String,
 	available: bool,
 	channels: HashMap<ChannelId, Channel>,
 	roles: HashMap<RoleId, Role>,
+	member_count: usize,
 	members: HashMap<UserId, Member>,
+	commands: HashMap<String, ApplicationCommand>,
 	recv: Recv<GuildEvent>,
 	client: Client,
 }
 
 impl Guild {
-	pub fn new(seed: GuildSeed) -> Result<Self, ProtocolError> {
+	pub(crate) async fn new(
+		seed: GuildSeed,
+		user_id: UserId,
+		application_id: ApplicationId,
+	) -> Result<Self, Error> {
 		let (gc, client, recv) = seed.inner();
 
 		let mut guild = Self {
-			id: gc.id,
-			name: String::new(),
+			id: gc.guild.id,
+			user_id,
+			application_id,
+			name: gc.guild.name.clone(),
 			available: false,
 			channels: HashMap::new(),
 			roles: HashMap::new(),
+			member_count: 0,
 			members: HashMap::new(),
+			commands: HashMap::new(),
 			recv,
 			client,
 		};
-		// guild.update(gc)?;
-		Self::update(&mut guild, gc)?;
+		guild.load_commands().await?;
+		guild.update(gc.guild);
 		Ok(guild)
 	}
 
@@ -94,35 +86,57 @@ impl Guild {
 		self.client.clone()
 	}
 
-	fn update(&mut self, gc: GuildCreate) -> Result<(), ProtocolError> {
-		self.name = gc.name;
-
-		for channel in gc.channels {
-			self.insert_channel(channel.try_into()?);
+	fn update(&mut self, guild: discord_types::Guild) {
+		self.name = guild.name;
+		self.channels = guild.channels.into_iter().map(|c| (c.id, c)).collect();
+		self.roles = guild.roles.into_iter().map(|r| (r.id, r)).collect();
+		for (id, member) in guild
+			.members
+			.into_iter()
+			.filter_map(|m| Some((m.user.as_ref()?.id, m)))
+		{
+			self.members.insert(id, member);
 		}
 
-		for role in gc.roles {
-			self.insert_role(role.into());
-		}
-
-		for member in gc.members {
-			self.insert_member(member.try_into()?);
+		let member_count = self.members.len();
+		let actual_member_count = guild.member_count.unwrap_or(0) as usize;
+		if member_count < actual_member_count {
+			debug!("Requesting all guild members");
+			let _ = self.client.request_guild_members(self.id);
 		}
 
 		info!(
-			"Loaded guild '{}' ({} channels, {} roles, {}/{} members)",
+			"Loaded guild '{}' ({} channels, {} roles, {}/{} members, {} commands)",
 			self.name,
 			self.channels.len(),
 			self.roles.len(),
-			self.members.len(),
-			gc.member_count,
+			member_count,
+			actual_member_count,
+			self.commands.len(),
 		);
+	}
 
+	async fn load_commands(&mut self) -> Result<(), Error> {
+		self.commands = self
+			.client
+			.commands(self.application_id, self.id)
+			.await?
+			.into_iter()
+			.map(|c| (c.name.clone(), c))
+			.collect();
 		Ok(())
 	}
 
-	pub fn id(&self) -> Snowflake {
+	pub fn id(&self) -> GuildId {
 		self.id
+	}
+
+	pub fn user_id(&self) -> UserId {
+		self.user_id
+	}
+
+	pub fn application_id(&self) -> ApplicationId {
+		self.application_id
 	}
 
 	pub fn name(&self) -> &str {
@@ -141,14 +155,6 @@ impl Guild {
 		self.channels.get(&id.into())
 	}
 
-	fn insert_channel(&mut self, src: Channel) -> Option<Channel> {
-		self.channels.insert(src.id, src)
-	}
-
-	fn delete_channel<T: Into<ChannelId>>(&mut self, id: T) -> Option<Channel> {
-		self.channels.remove(&id.into())
-	}
-
 	pub fn roles(&self) -> impl Iterator<Item = &Role> {
 		self.roles.values()
 	}
@@ -157,12 +163,8 @@ impl Guild {
 		self.roles.get(&id.into())
 	}
 
-	fn insert_role(&mut self, src: Role) -> Option<Role> {
-		self.roles.insert(src.id, src)
-	}
-
-	fn delete_role<T: Into<RoleId>>(&mut self, id: T) -> Option<Role> {
-		self.roles.remove(&id.into())
+	pub fn member_count(&self) -> usize {
+		self.member_count
 	}
 
 	pub fn members(&self) -> impl Iterator<Item = &Member> {
@@ -173,157 +175,112 @@ impl Guild {
 		self.members.get(&id.into())
 	}
 
-	fn insert_member(&mut self, src: Member) -> Option<Member> {
-		self.members.insert(src.user.id, src)
+	pub fn member_role_position(&self, member: &Member) -> u16 {
+		member
+			.roles
+			.iter()
+			.filter_map(|&id| self.role(id))
+			.map(|r| r.position)
+			.max()
+			.unwrap_or(0)
 	}
 
-	fn delete_member<T: Into<UserId>>(&mut self, id: T) -> Option<Member> {
-		self.members.remove(&id.into())
+	pub fn command(&self, name: &str) -> Option<&ApplicationCommand> {
+		self.commands.get(name)
 	}
 
 	pub async fn next_stateless(&mut self) -> Option<GuildEvent> {
 		self.recv.next().await
 	}
 
-	pub async fn next(&mut self) -> Option<Event> {
-		// Some `GuildEvent`s might not result in an `Event`, so we loop until we get one
+	pub async fn next(&mut self) -> Option<GuildEvent> {
+		// Some `GuildEvent`s might not be forwarded, so we loop until we get one
 		loop {
 			let event = match self.recv.next().await? {
-				GuildEvent::Online => return Some(Event::GuildOnline),
-				GuildEvent::Offline => return Some(Event::GuildOffline),
 				GuildEvent::Event(e) => e,
+				x => return Some(x),
 			};
 
-			use protocol::Event::*;
+			use Event::*;
 			let event = match event {
-				MessageCreate(protocol::MessageCreate { message }) => {
-					// Skip webhook messages
-					if message.webhook_id.is_some() {
-						continue;
-					}
-
-					// Skip messages without a member
-					let member_id = message.author.id;
-					if message.member.is_none() {
-						continue;
-					}
-
-					if message.message_type != MessageType::Default {
-						continue;
-					}
-
-					Event::MessageCreate(ti!((message, member_id)))
+				GuildCreate(gc) => {
+					self.update(gc.guild.clone());
+					GuildCreate(gc)
 				}
-				MessageDelete(md) => Event::MessageDelete(md.id.into(), md.channel_id.into()),
-				MessageDeleteBulk(md) => Event::MessageDeleteBulk(
-					md.ids.iter().map(|m| m.into()).collect(),
-					md.channel_id.into(),
-				),
-				MessageUpdate(protocol::MessageUpdate { message }) => {
-					// Skip webhook messages
-					if message.webhook_id.is_some() {
-						continue;
-					}
-
-					// Skip messages without a member
-					let member_id = message.author.id;
-					if message.member.is_none() {
-						continue;
-					}
-
-					if message.message_type != MessageType::Default {
-						continue;
-					}
-
-					Event::MessageUpdate(ti!((message, member_id)))
+				GuildUpdate(gu) => {
+					self.update(gu.guild.clone());
+					GuildUpdate(gu)
 				}
+				e @ MessageCreate(_) | e @ MessageUpdate(_) | e @ MessageDelete(_) => e,
 				GuildMemberAdd(ma) => {
-					let id = ma.member.user.id.into();
-					self.insert_member(ti!(ma.member));
-					Event::MemberJoin(id)
-				}
-				GuildMemberRemove(mr) => {
-					let member = match self.delete_member(mr.user.id) {
-						Some(m) => Either::Left(m),
-						None => Either::<_, User>::Right(ti!(mr.user)),
-					};
-					Event::MemberLeave(member)
+					if let Some(user_id) = ma.member.user.as_ref().map(|u| u.id) {
+						let member = ma.member.clone();
+						self.members.insert(user_id, member);
+					}
+					GuildMemberAdd(ma)
 				}
 				GuildMemberUpdate(mu) => {
-					let id = mu.user.id.into();
-
-					// Figure out which field changed and fire appropriate event
-					let premium_since =
-						t!(mu.premium_since.as_ref().map(|s| s.parse()).transpose());
-					if let Some(member) = self.members.get_mut(&id) {
-						if mu.nick != member.nickname {
-							Event::MemberChangeNickname(
-								id,
-								mem::replace(&mut member.nickname, mu.nick),
-							)
-						} else if mu.user.username != member.user.username
-							|| mu.user.discriminator != member.user.discriminator
-						{
-							Event::MemberChangeUsername(
-								id,
-								mem::replace(&mut member.user.username, mu.user.username),
-								mem::replace(&mut member.user.discriminator, mu.user.discriminator),
-							)
-						} else if mu.user.avatar != member.user.avatar {
-							Event::MemberChangeAvatar(
-								id,
-								mem::replace(&mut member.user.avatar, mu.user.avatar),
-							)
-						} else if premium_since != member.premium_since {
-							Event::MemberChangePremium(
-								id,
-								mem::replace(&mut member.premium_since, premium_since),
-							)
-						} else if let Some(role_id) = mu
-							.roles()
-							.symmetric_difference(&member.roles)
-							.next()
-							.map(|r| *r)
-						{
-							let event = if mu.roles.contains(&role_id) {
-								Event::MemberAddRole(id, role_id)
-							} else {
-								Event::MemberRemoveRole(id, role_id)
-							};
-							mem::replace(&mut member.roles, mu.roles());
-							event
-						} else {
-							Event::MemberUpdate(mu)
-						}
-					} else {
-						Event::MemberUpdate(mu)
+					if let Some(member) = self.members.get_mut(&mu.user.id) {
+						let event::GuildMemberUpdate {
+							roles,
+							user,
+							nick,
+							premium_since,
+							..
+						} = mu.clone();
+						member.roles = roles;
+						member.user = Some(user);
+						member.nick = nick;
+						member.premium_since = premium_since;
 					}
+					GuildMemberUpdate(mu)
+				}
+				GuildMemberRemove(mr) => {
+					self.members.remove(&mr.user.id);
+					GuildMemberRemove(mr)
+				}
+				GuildMembersChunk(mc) => {
+					for (id, member) in mc
+						.members
+						.iter()
+						.filter_map(|m| Some((m.user.as_ref()?.id, m)))
+					{
+						self.members.insert(id, member.clone());
+					}
+					GuildMembersChunk(mc)
 				}
 				GuildRoleCreate(rc) => {
-					let id = rc.role.id.into();
-					self.insert_role(ti!(rc.role));
-					Event::RoleCreate(id)
-				}
-				GuildRoleDelete(rd) => {
-					let id = rd.role_id.into();
-					Event::RoleDelete(id, self.delete_role(id))
+					let role = rc.role.clone();
+					self.roles.insert(role.id, role);
+					GuildRoleCreate(rc)
 				}
 				GuildRoleUpdate(ru) => {
-					Event::RoleUpdate(ru.role.id.into(), self.insert_role(ti!(ru.role)))
+					let role = ru.role.clone();
+					self.roles.insert(role.id, role);
+					GuildRoleUpdate(ru)
+				}
+				GuildRoleDelete(rd) => {
+					self.roles.remove(&rd.role_id);
+					for (_, member) in self.members.iter_mut() {
+						member.roles.remove(&rd.role_id);
+					}
+					GuildRoleDelete(rd)
 				}
 				ChannelCreate(cc) => {
-					let id = cc.channel.id.into();
-					self.insert_channel(ti!(cc.channel));
-					Event::ChannelCreate(id)
-				}
-				ChannelDelete(cd) => {
-					let id = cd.channel.id.into();
-					Event::ChannelDelete(id, self.delete_channel(id))
+					let channel = cc.channel.clone();
+					self.channels.insert(channel.id, channel);
+					ChannelCreate(cc)
 				}
 				ChannelUpdate(cu) => {
-					Event::ChannelUpdate(cu.channel.id.into(), self.insert_channel(ti!(cu.channel)))
+					let channel = cu.channel.clone();
+					self.channels.insert(channel.id, channel);
+					ChannelUpdate(cu)
 				}
-				MessageReactionAdd(ra) => Event::ReactionAdd(
+				ChannelDelete(cd) => {
+					self.channels.remove(&cd.channel.id);
+					ChannelDelete(cd)
+				}
+				/*MessageReactionAdd(ra) => Event::ReactionAdd(
 					ra.user_id.into(),
 					ra.channel_id.into(),
 					ra.message_id.into(),
@@ -343,11 +300,37 @@ impl Guild {
 					re.channel_id.into(),
 					re.message_id.into(),
 					ReactionRemoveType::Emoji(ti!(re.emoji)),
-				),
-				e => Event::Other(e),
+				),*/
+				ApplicationCommandCreate(cc) => {
+					let command = cc.command.clone();
+					self.commands.insert(command.name.clone(), command);
+					ApplicationCommandCreate(cc)
+				}
+				ApplicationCommandUpdate(cu) => {
+					let command = cu.command.clone();
+					self.commands.insert(command.name.clone(), command);
+					ApplicationCommandUpdate(cu)
+				}
+				ApplicationCommandDelete(cd) => {
+					self.commands.remove(&cd.command.name);
+					ApplicationCommandDelete(cd)
+				}
+				e @ InteractionCreate(_) => e,
+				GuildDelete(gd) => {
+					// TODO
+					GuildDelete(gd)
+				}
+				e @ VoiceStateUpdate(_) => e,
+				e @ VoiceServerUpdate(_) => e,
+				e @ Hello(_)
+				| e @ Ready(_)
+				| e @ Resumed
+				| e @ InvalidSession(_)
+				| e @ HeartbeatAck
+				| e @ Unknown(_) => e,
 			};
 
-			return Some(event);
+			return Some(GuildEvent::Event(event));
 		}
 	}
 }
@@ -355,17 +338,17 @@ impl Guild {
 pub enum GuildEvent {
 	Offline,
 	Online,
-	Event(protocol::Event),
+	Event(Event),
 }
 
-impl From<protocol::Event> for GuildEvent {
-	fn from(event: protocol::Event) -> Self {
+impl From<Event> for GuildEvent {
+	fn from(event: Event) -> Self {
 		GuildEvent::Event(event)
 	}
 }
 
-impl From<GuildCreate> for GuildEvent {
-	fn from(gc: GuildCreate) -> Self {
-		GuildEvent::Event(gc.into())
+impl From<event::GuildCreate> for GuildEvent {
+	fn from(gc: event::GuildCreate) -> Self {
+		GuildEvent::Event(Event::GuildCreate(gc))
 	}
 }
