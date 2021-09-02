@@ -120,16 +120,12 @@ impl Connection {
 	}
 
 	fn connect_params(&self) -> Option<ConnectParams> {
-		let session_id = self.session_id.as_ref()?;
-		let token = self.token.as_ref()?;
-		let endpoint = self.endpoint.as_ref()?;
-
 		Some(ConnectParams {
 			guild_id: self.guild_id,
 			user_id: self.user_id,
-			session_id: session_id.clone(),
-			token: token.clone(),
-			endpoint: endpoint.clone(),
+			session_id: self.session_id.as_ref()?.clone().into(),
+			token: self.token.as_ref()?.clone().into(),
+			endpoint: self.endpoint.as_ref()?.clone().into(),
 		})
 	}
 

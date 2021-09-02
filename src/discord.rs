@@ -60,7 +60,7 @@ impl Builder {
 	pub fn build(self) -> Result<Discord, Error> {
 		let (seed_send, seed_recv) = mpsc::channel(8);
 		let (command_send, command_recv) = mpsc::channel(8);
-		let client = Client::new(self.token.clone(), command_send.clone())?;
+		let client = Client::new(&self.token, command_send.clone())?;
 		task::spawn(start_discord(
 			self.token,
 			self.intents,

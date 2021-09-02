@@ -124,7 +124,14 @@ impl<'a> Connector<'a> {
 
 	pub async fn connect(self) -> Result<(Gateway, Duration, Option<event::Ready>), Error> {
 		let encoder = match self.encoding {
-			Encoding::Json => Box::new(JsonCodec::new(None)) as Box<dyn Codec<Command, Payload>>,
+			Encoding::Json => {
+				let file = if cfg!(debug_assertions) {
+					Some("events.log")
+				} else {
+					None
+				};
+				Box::new(JsonCodec::new(file)) as Box<dyn Codec<Command, Payload>>
+			}
 		};
 
 		let url = format!(
@@ -148,12 +155,12 @@ impl<'a> Connector<'a> {
 				let properties = self
 					.properties
 					.unwrap_or_else(|| command::ConnectionProperties {
-						os: String::from("linux"),
-						browser: String::from("discord-async-rs"),
-						device: String::from("discord-async-rs"),
+						os: "linux".into(),
+						browser: "discord-async-rs".into(),
+						device: "discord-async-rs".into(),
 					});
 				let command = command::Identify {
-					token: token.into(),
+					token: token.to_owned().into(),
 					properties,
 					compress: None,
 					large_threshold: None,
@@ -168,8 +175,8 @@ impl<'a> Connector<'a> {
 				// Resume session
 				debug!("Connection established, resuming previous session..");
 				let command = command::Resume {
-					token: token.into(),
-					session_id: session_id.into(),
+					token: token.to_owned().into(),
+					session_id: session_id.to_owned().into(),
 					seq,
 				};
 				command.into()

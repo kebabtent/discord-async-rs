@@ -18,6 +18,8 @@ use std::time::Duration;
 use tokio::time;
 use tokio_stream::wrappers::IntervalStream;
 
+type CowString = std::borrow::Cow<'static, str>;
+
 trait Error: std::error::Error + Send + Sync + 'static {}
 
 impl<T> Error for T where T: std::error::Error + Send + Sync + 'static {}
@@ -72,13 +74,13 @@ impl Controller {
 		.await
 	}
 
-	pub async fn select_protocol(&mut self, addr: SocketAddr, mode: &str) -> bool {
+	pub async fn select_protocol<T: Into<CowString>>(&mut self, addr: SocketAddr, mode: T) -> bool {
 		self.send(Command::SelectProtocol(command::SelectProtocol {
-			protocol: String::from("udp"),
+			protocol: "udp".into(),
 			data: command::SelectProtocolData {
-				address: addr.ip().to_string(),
+				address: addr.ip().to_string().into(),
 				port: addr.port(),
-				mode: String::from(mode),
+				mode: mode.into(),
 			},
 		}))
 		.await
@@ -94,9 +96,9 @@ impl From<mpsc::Sender<Command>> for Controller {
 pub struct ConnectParams {
 	pub guild_id: GuildId,
 	pub user_id: UserId,
-	pub session_id: String,
-	pub token: String,
-	pub endpoint: String,
+	pub session_id: CowString,
+	pub token: CowString,
+	pub endpoint: CowString,
 }
 
 #[pin_project]

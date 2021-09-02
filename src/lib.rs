@@ -1,4 +1,6 @@
-pub use crate::client::{Client, Error as ClientError, OptionalResult};
+pub use crate::client::{
+	ButtonComponent, Client, Error as ClientError, OptionalResult, RowComponent,
+};
 pub use crate::discord::{Builder, Discord};
 pub use crate::gateway::{Connector, Error as GatewayError, Gateway};
 pub use crate::guild::{Guild, GuildEvent, GuildSeed};
@@ -13,6 +15,7 @@ mod discord;
 mod gateway;
 mod guild;
 pub mod interaction;
+// pub mod message;
 #[cfg(feature = "voice")]
 pub mod voice;
 

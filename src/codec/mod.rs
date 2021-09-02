@@ -4,7 +4,6 @@ use async_tungstenite::tokio::connect_async;
 use async_tungstenite::tokio::ConnectStream;
 use async_tungstenite::tungstenite;
 use async_tungstenite::WebSocketStream;
-use futures::sink::Send as SendFut;
 use futures::{Sink, Stream};
 use pin_project::pin_project;
 use std::pin::Pin;

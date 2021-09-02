@@ -2,9 +2,9 @@ use crate::ApiError;
 use discord_types::command::{RequestGuildMembers, UpdateVoiceState};
 use discord_types::request;
 use discord_types::{
-	AllowedMentions, ApplicationCommand, ApplicationCommandOption, ApplicationId, ChannelId,
-	Command, Embed, GuildId, InteractionResponseType, Member, Message, MessageId, RoleId,
-	Snowflake, UserId,
+	AllowedMentions, ApplicationCommand, ApplicationCommandOption, ApplicationId, ButtonStyle,
+	ChannelId, Command, Component, ComponentEmoji, ComponentType, Embed, GuildId, InteractionId,
+	InteractionResponseType, Member, Message, MessageId, RoleId, UserId,
 };
 use futures::channel::mpsc;
 use reqwest::multipart::{Form, Part};
@@ -14,6 +14,8 @@ use serde::Serialize;
 use std::collections::HashSet;
 use std::fmt;
 use std::time::Duration;
+
+type CowString = std::borrow::Cow<'static, str>;
 
 const URL_PREFIX: &str = "https://discord.com/api/v8/";
 
@@ -134,7 +136,7 @@ pub struct Client {
 }
 
 impl Client {
-	pub fn new(token: String, command_send: mpsc::Sender<Command>) -> Result<Self, Error> {
+	pub fn new(token: &str, command_send: mpsc::Sender<Command>) -> Result<Self, Error> {
 		let mut headers = header::HeaderMap::new();
 		headers.insert(
 			header::USER_AGENT,
@@ -163,7 +165,7 @@ impl Client {
 	pub fn request_guild_members(&mut self, guild_id: GuildId) -> Result<(), ()> {
 		let req = RequestGuildMembers {
 			guild_id,
-			query: String::new(),
+			query: "".into(),
 			limit: 0,
 			presences: None,
 			user_ids: HashSet::new(),
@@ -263,19 +265,42 @@ impl Client {
 		Ok(())
 	}
 
+	async fn patch<S, D>(&self, url: &str, body: S) -> Result<D, Error>
+	where
+		S: Serialize,
+		D: DeserializeOwned,
+	{
+		decode(
+			self.client
+				.patch(&format!("{}{}", URL_PREFIX, url))
+				.header(header::CONTENT_TYPE, "application/json")
+				.json(&body)
+				.send()
+				.await?,
+		)
+		.await
+	}
+
 	async fn delete(&self, url: &str) -> Result<(), Error> {
-		self.client
-			.delete(&format!("{}{}", URL_PREFIX, url))
-			.send()
-			.await?;
+		check_response_code(
+			self.client
+				.delete(&format!("{}{}", URL_PREFIX, url))
+				.send()
+				.await?,
+		)
+		.await?;
 		Ok(())
 	}
 
-	pub fn create_message<T: Into<ChannelId>>(&self, channel_id: T) -> CreateMessageBuilder<'_> {
+	pub fn create_message(&self, channel_id: ChannelId) -> CreateMessageBuilder<'_> {
 		CreateMessageBuilder {
 			client: &self,
 			channel_id: channel_id.into(),
 		}
+	}
+
+	pub fn edit_message(&self, channel_id: ChannelId, message_id: MessageId) -> EditMessage<'_> {
+		EditMessage::new(self, channel_id, message_id)
 	}
 
 	pub async fn delete_message<T: Into<(ChannelId, MessageId)>>(
@@ -341,10 +366,11 @@ impl Client {
 
 	pub fn interaction_response<'a>(
 		&'a self,
-		interaction_id: Snowflake,
+		interaction_id: InteractionId,
 		token: &'a str,
+		component: bool,
 	) -> InteractionResponse<'a> {
-		InteractionResponse::new(self, interaction_id, token)
+		InteractionResponse::new(self, interaction_id, token, component)
 	}
 
 	pub async fn get_guild_member(
@@ -412,28 +438,29 @@ pub struct CreateMessageBuilder<'a> {
 }
 
 impl<'a> CreateMessageBuilder<'a> {
-	pub fn content(self, content: String) -> CreateMessage<'a> {
-		CreateMessage {
-			client: self.client,
-			channel_id: self.channel_id,
-			attachment: None,
-			cm: request::CreateMessage {
-				content: Some(content),
-				embed: None,
-			},
-		}
-	}
-
-	pub fn embed(self, embed: Embed) -> CreateMessage<'a> {
+	fn into(self) -> CreateMessage<'a> {
 		CreateMessage {
 			client: self.client,
 			channel_id: self.channel_id,
 			attachment: None,
 			cm: request::CreateMessage {
 				content: None,
-				embed: Some(embed),
+				embeds: Vec::new(),
+				components: Vec::new(),
 			},
 		}
+	}
+
+	pub fn content<T: Into<CowString>>(self, content: T) -> CreateMessage<'a> {
+		let mut cm = self.into();
+		cm.cm.content = Some(content.into());
+		cm
+	}
+
+	pub fn embeds<I: IntoIterator<Item = Embed>>(self, embeds: I) -> CreateMessage<'a> {
+		let mut cm = self.into();
+		cm.cm.embeds = embeds.into_iter().collect();
+		cm
 	}
 }
 
@@ -445,18 +472,23 @@ pub struct CreateMessage<'a> {
 }
 
 impl<'a> CreateMessage<'a> {
-	pub fn content(mut self, content: String) -> Self {
-		self.cm.content = Some(content);
+	pub fn content<T: Into<CowString>>(mut self, content: T) -> Self {
+		self.cm.content = Some(content.into());
 		self
 	}
 
 	pub fn embed(mut self, embed: Embed) -> Self {
-		self.cm.embed = Some(embed);
+		self.cm.embeds.push(embed);
 		self
 	}
 
 	pub fn attachment(mut self, attachment: request::Attachment) -> Self {
 		self.attachment = Some(attachment);
+		self
+	}
+
+	pub fn component_row(mut self, row: RowComponent) -> Self {
+		self.cm.components.push(row.component);
 		self
 	}
 
@@ -474,6 +506,153 @@ impl<'a> CreateMessage<'a> {
 		} else {
 			self.client.post(&url, self.cm).await
 		}
+	}
+}
+
+pub struct EditMessage<'a> {
+	client: &'a Client,
+	channel_id: ChannelId,
+	message_id: MessageId,
+	em: request::EditMessage,
+}
+
+impl<'a> EditMessage<'a> {
+	fn new(client: &'a Client, channel_id: ChannelId, message_id: MessageId) -> Self {
+		Self {
+			client,
+			channel_id,
+			message_id,
+			em: request::EditMessage {
+				content: None,
+				embeds: None,
+				components: None,
+			},
+		}
+	}
+
+	pub fn content<T: Into<CowString>>(mut self, content: T) -> Self {
+		self.em.content = Some(content.into());
+		self
+	}
+
+	pub fn embed(mut self, embed: Embed) -> Self {
+		self.em.embeds.get_or_insert_with(|| Vec::new()).push(embed);
+		self
+	}
+
+	pub fn component_row(mut self, row: RowComponent) -> Self {
+		self.em
+			.components
+			.get_or_insert_with(|| Vec::new())
+			.push(row.component);
+		self
+	}
+
+	pub async fn send(self) -> Result<Message, Error> {
+		let url = format!("channels/{}/messages/{}", self.channel_id, self.message_id);
+		self.client.patch(&url, self.em).await
+	}
+}
+
+#[derive(Clone)]
+pub struct RowComponent {
+	component: Component,
+}
+
+impl RowComponent {
+	pub fn new() -> Self {
+		Self {
+			component: Component {
+				component_type: ComponentType::ActionRow,
+				style: None,
+				label: None,
+				emoji: None,
+				custom_id: None,
+				url: None,
+				disabled: None,
+				default: None,
+				components: Vec::with_capacity(5),
+			},
+		}
+	}
+
+	pub fn button(mut self, button: ButtonComponent) -> Self {
+		self.component.components.push(button.component);
+		self
+	}
+}
+
+impl From<ButtonComponent> for RowComponent {
+	fn from(button: ButtonComponent) -> RowComponent {
+		RowComponent::new().button(button)
+	}
+}
+
+#[derive(Clone)]
+pub struct ButtonComponent {
+	component: Component,
+}
+
+impl ButtonComponent {
+	fn new(style: ButtonStyle) -> Self {
+		Self {
+			component: Component {
+				component_type: ComponentType::Button,
+				style: Some(style),
+				label: None,
+				emoji: None,
+				custom_id: None,
+				url: None,
+				disabled: None,
+				default: None,
+				components: Vec::new(),
+			},
+		}
+	}
+
+	pub fn primary<T: Into<CowString>>(custom_id: T) -> Self {
+		let mut button = Self::new(ButtonStyle::Primary);
+		button.component.custom_id = Some(custom_id.into());
+		button
+	}
+
+	pub fn secondary<T: Into<CowString>>(custom_id: T) -> Self {
+		let mut button = Self::new(ButtonStyle::Secondary);
+		button.component.custom_id = Some(custom_id.into());
+		button
+	}
+
+	pub fn success<T: Into<CowString>>(custom_id: T) -> Self {
+		let mut button = Self::new(ButtonStyle::Success);
+		button.component.custom_id = Some(custom_id.into());
+		button
+	}
+
+	pub fn danger<T: Into<CowString>>(custom_id: T) -> Self {
+		let mut button = Self::new(ButtonStyle::Danger);
+		button.component.custom_id = Some(custom_id.into());
+		button
+	}
+
+	pub fn link<T: Into<CowString>>(url: T) -> Self {
+		let mut button = Self::new(ButtonStyle::Link);
+		button.component.url = Some(url.into());
+		button
+	}
+
+	pub fn label<T: Into<CowString>>(mut self, label: T) -> Self {
+		self.component.label = Some(label.into());
+		self
+	}
+
+	pub fn disabled(mut self) -> Self {
+		self.component.disabled = Some(true);
+		self
+	}
+
+	pub fn emoji<T: Into<ComponentEmoji>>(mut self, emoji: T) -> Self {
+		self.component.emoji = Some(emoji.into());
+		self
 	}
 }
 
@@ -507,19 +686,30 @@ impl<'a> CreateGuildBan<'a> {
 
 pub struct InteractionResponse<'a> {
 	client: &'a Client,
-	interaction_id: Snowflake,
+	interaction_id: InteractionId,
 	token: &'a str,
 	ir: request::InteractionResponse<'a>,
 }
 
 impl<'a> InteractionResponse<'a> {
-	fn new(client: &'a Client, interaction_id: Snowflake, token: &'a str) -> Self {
+	fn new(
+		client: &'a Client,
+		interaction_id: InteractionId,
+		token: &'a str,
+		component: bool,
+	) -> Self {
+		let response_type = if component {
+			InteractionResponseType::UpdateMessage
+		} else {
+			InteractionResponseType::ChannelMessage
+		};
+
 		Self {
 			client,
 			interaction_id,
 			token,
 			ir: request::InteractionResponse {
-				response_type: InteractionResponseType::ChannelMessage,
+				response_type,
 				data: None,
 			},
 		}
@@ -537,8 +727,45 @@ impl<'a> InteractionResponse<'a> {
 		self
 	}
 
+	pub fn clear_embeds(mut self) -> Self {
+		self.data().embeds = Some(Vec::new());
+		self
+	}
+
 	pub fn embed(mut self, embed: Embed) -> Self {
-		self.data().embeds.push(embed);
+		self.data()
+			.embeds
+			.get_or_insert_with(|| Vec::new())
+			.push(embed);
+		self
+	}
+
+	pub fn embeds<I>(mut self, embeds: I) -> Self
+	where
+		I: IntoIterator<Item = Embed>,
+	{
+		self.data().embeds = Some(embeds.into_iter().collect());
+		self
+	}
+
+	pub fn clear_component_rows(mut self) -> Self {
+		self.data().components = Some(Vec::new());
+		self
+	}
+
+	pub fn component_row(mut self, row: RowComponent) -> Self {
+		self.data()
+			.components
+			.get_or_insert_with(|| Vec::new())
+			.push(row.component);
+		self
+	}
+
+	pub fn component_rows<I>(mut self, rows: I) -> Self
+	where
+		I: IntoIterator<Item = RowComponent>,
+	{
+		self.data().components = Some(rows.into_iter().map(|r| r.component).collect());
 		self
 	}
 
@@ -559,7 +786,7 @@ impl<'a> InteractionResponse<'a> {
 
 	pub async fn send(mut self) -> Result<(), Error> {
 		if let Some(data) = &self.ir.data {
-			if data.content.is_none() && data.embeds.is_empty() {
+			if data.content.is_none() && data.embeds.is_none() && data.components.is_none() {
 				self.ir.data = None;
 			}
 		}
@@ -574,4 +801,10 @@ impl<'a> InteractionResponse<'a> {
 			)
 			.await
 	}
+}
+
+pub struct EditInteractionResponse<'a> {
+	client: &'a Client,
+	application_id: ApplicationId,
+	token: &'a str,
 }

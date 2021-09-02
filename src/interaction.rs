@@ -1,41 +1,57 @@
-use crate::client::Error;
+pub use crate::client::{ButtonComponent, RowComponent};
+use crate::client::{Client, Error};
 use crate::guild::Guild;
-use discord_types::Embed;
 pub use discord_types::{AllowedMentions, Interaction};
+use discord_types::{Embed, InteractionId};
 use log::warn;
 use std::borrow::Cow;
 use std::future::Future;
 use tokio::task::JoinHandle;
 
-pub trait CanRespond<'a> {
-	fn respond(&'a self, guild: &'a Guild) -> ResponseTask<'a>;
+pub trait CanRespond {
+	fn respond(&self, guild: &Guild) -> ResponseBuilder;
 }
 
-impl<'a> CanRespond<'a> for Interaction {
-	fn respond(&'a self, guild: &'a Guild) -> ResponseTask<'a> {
-		ResponseTask::new(self, guild)
+impl CanRespond for Interaction {
+	fn respond(&self, guild: &Guild) -> ResponseBuilder {
+		ResponseBuilder::new(self, guild.client())
 	}
 }
 
-pub struct ResponseTask<'a> {
-	interaction: &'a Interaction,
-	guild: &'a Guild,
+#[derive(Clone)]
+pub struct ResponseBuilder {
+	interaction_id: InteractionId,
+	token: String,
+	component: bool,
+	client: Client,
 	content: Option<Cow<'static, str>>,
-	embeds: Vec<Embed>,
+	embeds: Option<Vec<Embed>>,
+	rows: Option<Vec<RowComponent>>,
 	ephemeral: bool,
 	allowed_mentions: Option<AllowedMentions>,
 }
 
-impl<'a> ResponseTask<'a> {
-	fn new(interaction: &'a Interaction, guild: &'a Guild) -> Self {
-		ResponseTask {
-			interaction,
-			guild,
+impl ResponseBuilder {
+	fn new(interaction: &Interaction, client: Client) -> Self {
+		ResponseBuilder {
+			interaction_id: interaction.id,
+			token: interaction.token.clone(),
+			component: interaction.is_component_interaction(),
+			client,
 			content: None,
-			embeds: Vec::new(),
+			embeds: None,
+			rows: None,
 			ephemeral: false,
 			allowed_mentions: None,
 		}
+	}
+
+	pub fn interaction_id(&self) -> InteractionId {
+		self.interaction_id
+	}
+
+	pub fn is_component_interaction(&self) -> bool {
+		self.component
 	}
 
 	pub fn content<T: Into<Cow<'static, str>>>(mut self, content: T) -> Self {
@@ -43,8 +59,23 @@ impl<'a> ResponseTask<'a> {
 		self
 	}
 
+	pub fn clear_embeds(mut self) -> Self {
+		self.embeds = Some(Vec::new());
+		self
+	}
+
 	pub fn embed(mut self, embed: Embed) -> Self {
-		self.embeds.push(embed);
+		self.embeds.get_or_insert_with(|| Vec::new()).push(embed);
+		self
+	}
+
+	pub fn clear_component_rows(mut self) -> Self {
+		self.rows = Some(Vec::new());
+		self
+	}
+
+	pub fn component_row(mut self, row: RowComponent) -> Self {
+		self.rows.get_or_insert_with(|| Vec::new()).push(row);
 		self
 	}
 
@@ -60,26 +91,29 @@ impl<'a> ResponseTask<'a> {
 
 	pub fn send(self) -> impl Future<Output = Result<(), Error>> {
 		let Self {
-			guild,
-			interaction,
+			interaction_id,
+			token,
+			component,
+			client,
 			content,
 			embeds,
+			rows,
 			ephemeral,
 			allowed_mentions,
 		} = self;
 
-		let client = guild.client();
-		let interaction_id = interaction.id;
-		let token = interaction.token.clone();
-
 		async move {
-			let mut res = client.interaction_response(interaction_id, &token);
+			let mut res = client.interaction_response(interaction_id, &token, component);
 			if let Some(content) = &content {
-				res = res.content(&content);
+				res = res.content(content);
 			}
-			for embed in embeds {
-				res = res.embed(embed);
+			if let Some(embeds) = embeds {
+				res = res.embeds(embeds);
 			}
+			if let Some(rows) = rows {
+				res = res.component_rows(rows);
+			}
+
 			if ephemeral {
 				res = res.ephemeral();
 			}
