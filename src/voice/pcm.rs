@@ -54,6 +54,13 @@ impl Decoder for PcmCodec {
 			Ok(None)
 		}
 	}
+
+	fn decode_eof(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+		match self.decode(src)? {
+			Some(frame) => Ok(Some(frame)),
+			None => Ok(None),
+		}
+	}
 }
 
 pub fn frame_sample_size(stereo: bool) -> usize {

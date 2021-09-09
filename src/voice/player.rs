@@ -193,7 +193,6 @@ impl Player {
 							if !self.send_event(Event::Finished).await {
 								break;
 							}
-							break; // Temporary
 							enc = Box::pin(Either::Right(pending()));
 						}
 					}
