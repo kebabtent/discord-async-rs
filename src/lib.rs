@@ -3,9 +3,8 @@ pub use crate::client::{
 };
 pub use crate::discord::{Builder, Discord};
 pub use crate::gateway::{Connector, Error as GatewayError, Gateway};
-pub use crate::guild::{Guild, GuildEvent, GuildSeed};
+pub use crate::guild::{Guild, GuildEvent};
 pub use discord_types as types;
-use futures::channel::mpsc;
 use serde::Deserialize;
 use std::fmt;
 
@@ -18,9 +17,6 @@ pub mod interaction;
 // pub mod message;
 #[cfg(feature = "voice")]
 pub mod voice;
-
-pub(crate) type Send<T> = mpsc::Sender<T>;
-pub(crate) type Recv<T> = mpsc::Receiver<T>;
 
 #[derive(Debug)]
 pub enum Error {

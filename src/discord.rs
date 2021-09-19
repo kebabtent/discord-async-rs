@@ -1,37 +1,43 @@
-use crate::guild::{GuildEvent, GuildSeed};
-use crate::{Client, Connector, Error, Gateway, GatewayError, Guild, ProtocolError, Recv, Send};
-use discord_types::{Application, ApplicationId, Command, Event, GuildId, Intents, User, UserId};
-use futures::channel::mpsc;
+use crate::guild::{Guild, GuildEvent};
+use crate::{Client, Connector, Error, Gateway, GatewayError};
+use discord_types::event::GuildCreate;
+use discord_types::{Application, ApplicationId, Command, Intents, User, UserId};
+use futures::channel::mpsc::Receiver;
+use futures::channel::{mpsc, oneshot};
 use futures::stream::{self, SplitSink, SplitStream};
 use futures::{pin_mut, select};
-use futures::{FutureExt, SinkExt, Stream, StreamExt};
-use log::{debug, info, warn};
+use futures::{Future, FutureExt, SinkExt, Stream, StreamExt};
+use log::{debug, warn};
 use never::Never;
 use pin_project::pin_project;
-use std::collections::HashMap;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::{task, time};
 use tokio_stream::wrappers::IntervalStream;
 
-type Guilds = HashMap<GuildId, (bool, Option<Send<GuildEvent>>)>;
+type InitSend = oneshot::Sender<Init>;
+type Init = (Application, User);
 
-pub struct Builder {
-	token: String,
-	intents: Intents,
+trait Callback<G: Fut>: FnMut(GuildEvent) -> G + Send + Sync + 'static {}
+trait Fut: Future<Output = ()> {}
+
+impl<G> Fut for G where G: Future<Output = ()> + Send + Sync + 'static {}
+
+impl<F, G> Callback<G> for F
+where
+	F: FnMut(GuildEvent) -> G + Send + Sync + 'static,
+	G: Fut,
+{
 }
 
-impl Builder {
-	pub fn new(token: String) -> Self {
-		Self {
-			token,
-			intents: Intents::GUILD_ALL ^ Intents::GUILD_WEBHOOKS ^ Intents::GUILD_MESSAGE_TYPING,
-		}
-	}
+pub struct Builder<F> {
+	token: String,
+	intents: Intents,
+	callback: F,
+}
 
+impl<F> Builder<F> {
 	pub fn with_webhooks(mut self) -> Self {
 		self.intents |= Intents::GUILD_WEBHOOKS;
 		self
@@ -56,36 +62,50 @@ impl Builder {
 		self.intents ^= intents;
 		self
 	}
+}
 
-	pub fn build(self) -> Result<Discord, Error> {
-		let (seed_send, seed_recv) = mpsc::channel(8);
+impl<F, G> Builder<F>
+where
+	F: FnMut(GuildEvent) -> G + Send + Sync + 'static,
+	G: Future<Output = ()> + Send + Sync + 'static,
+{
+	pub fn new(token: String, callback: F) -> Self {
+		Self {
+			token,
+			callback,
+			intents: Intents::GUILD_ALL ^ Intents::GUILD_WEBHOOKS ^ Intents::GUILD_MESSAGE_TYPING,
+		}
+	}
+
+	pub async fn build(self) -> Result<Discord, Error> {
 		let (command_send, command_recv) = mpsc::channel(8);
-		let client = Client::new(&self.token, command_send.clone())?;
+		let (init_send, init_recv) = oneshot::channel();
+		let client = Client::new(&self.token, command_send)?;
 		task::spawn(start_discord(
 			self.token,
 			self.intents,
-			seed_send,
+			init_send,
+			self.callback,
 			command_recv,
-			client.clone(),
 		));
+
+		let (application, user) = init_recv
+			.await
+			.map_err(|_| Error::Gateway(GatewayError::Close(None)))?;
+
 		Ok(Discord {
-			user: None,
-			application: None,
-			seed_recv,
+			application,
+			user,
 			client,
-			command_send,
 		})
 	}
 }
 
 #[pin_project]
 pub struct Discord {
-	user: Option<User>,
-	application: Option<Application>,
-	#[pin]
-	seed_recv: Recv<Seed>,
+	application: Application,
+	user: User,
 	client: Client,
-	command_send: Send<Command>,
 }
 
 impl Discord {
@@ -93,152 +113,112 @@ impl Discord {
 		self.client.clone()
 	}
 
-	pub fn user_id(&self) -> Option<UserId> {
-		self.user.as_ref().map(|a| a.id)
+	pub fn user_id(&self) -> UserId {
+		self.user.id
 	}
 
-	pub fn application_id(&self) -> Option<ApplicationId> {
-		self.application.as_ref().map(|a| a.id)
+	pub fn application_id(&self) -> ApplicationId {
+		self.application.id
 	}
 
-	pub async fn seed_guild(&self, seed: GuildSeed) -> Result<Guild, Error> {
+	pub async fn guild<S: Stream<Item = GuildEvent> + Unpin + Sync + Send + 'static>(
+		&self,
+		stream: S,
+		gc: GuildCreate,
+	) -> Result<Guild<S>, Error> {
 		Guild::new(
-			seed,
-			self.user_id()
-				.ok_or_else(|| ProtocolError::MissingField("user"))?,
-			self.application_id()
-				.ok_or_else(|| ProtocolError::MissingField("application"))?,
+			stream,
+			gc,
+			self.client.clone(),
+			self.user.id,
+			self.application.id,
 		)
 		.await
 	}
 }
 
-impl Stream for Discord {
-	type Item = GuildSeed;
-
-	fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-		let mut this = self.as_mut().project();
-		loop {
-			return match this.seed_recv.as_mut().poll_next(cx) {
-				Poll::Ready(Some(Seed::Guild(guild))) => Poll::Ready(Some(guild)),
-				Poll::Ready(Some(Seed::User(user))) => {
-					if this.user.is_none() {
-						info!("User id: {}", user.id);
-						*this.user = Some(user);
-					}
-					continue;
-				}
-				Poll::Ready(Some(Seed::Application(application))) => {
-					if this.application.is_none() {
-						info!("Application id: {}", application.id);
-						*this.application = Some(application);
-					}
-					continue;
-				}
-				Poll::Ready(None) => Poll::Ready(None),
-				Poll::Pending => Poll::Pending,
-			};
-		}
-	}
-}
-
-enum Seed {
-	User(User),
-	Application(Application),
-	Guild(GuildSeed),
-}
-
-struct Meta {
-	pub session_id: Option<String>,
-	pub user: Option<User>,
-	pub application: Option<Application>,
-}
-
-impl Meta {
-	pub fn new() -> Self {
-		Self {
-			session_id: None,
-			user: None,
-			application: None,
-		}
-	}
-}
-
-async fn start_discord(
+async fn start_discord<F: Callback<G>, G: Fut>(
 	token: String,
 	intents: Intents,
-	mut seed_send: Send<Seed>,
-	mut command_recv: Recv<Command>,
-	client: Client,
+	init_send: InitSend,
+	mut callback: F,
+	mut command_recv: Receiver<Command>,
 ) {
-	let mut guilds = HashMap::new();
-	let mut meta = Meta::new();
+	let mut session_id = None;
 	let sequence = Arc::new(AtomicU64::new(0));
+	let mut init_send = Some(init_send);
 
 	loop {
 		match connect(
 			&token,
 			intents,
-			&mut meta,
+			&mut session_id,
 			sequence.clone(),
-			&mut guilds,
-			&mut seed_send,
+			&mut callback,
+			&mut init_send,
 			&mut command_recv,
-			client.clone(),
 		)
 		.await
 		{
 			Ok(_) => unreachable!(),
 			Err(e) => warn!("Connection error: {:?}", e),
 		}
-		for (_, send) in guilds.values_mut() {
-			// Don't mark them offline in our local map so we can deal with resumes
-			send_or_drop(send, GuildEvent::Offline);
-		}
 		time::sleep(Duration::from_secs(3)).await; // TODO: exponential backoff?
 	}
 }
 
-async fn connect(
+async fn connect<F: Callback<G>, G: Fut>(
 	token: &str,
 	intents: Intents,
-	meta: &mut Meta,
+	session_id: &mut Option<String>,
 	sequence: Arc<AtomicU64>,
-	guilds: &mut Guilds,
-	seed_send: &mut Send<Seed>,
-	command_recv: &mut Recv<Command>,
-	client: Client,
+	callback: &mut F,
+	init_send: &mut Option<InitSend>,
+	command_recv: &mut Receiver<Command>,
 ) -> Result<Never, GatewayError> {
-	let connector = match meta.session_id.as_deref() {
+	let connector = match session_id.as_deref() {
 		Some(s) => Connector::resume(&token, s, sequence.load(Ordering::Relaxed), intents),
 		None => Connector::new(&token, intents),
 	};
+	let is_new = connector.is_new();
 
 	let (gateway, heartbeat_interval, ready) = connector.connect().await?;
-	if let Some(ready) = ready {
-		meta.session_id = Some(ready.session_id);
-		meta.user = Some(ready.user.clone());
-		meta.application = Some(ready.application);
-
-		let _ = seed_send.send(Seed::User(ready.user)).await;
-		let _ = seed_send.send(Seed::Application(ready.application)).await;
+	if let Some(init_send) = init_send.take() {
+		match ready {
+			Some(ready) => {
+				let _ = init_send.send((ready.application, ready.user));
+			}
+			None => {
+				if is_new {
+					return Err(GatewayError::UnexpectedEvent);
+				}
+			}
+		}
 	}
 
-	let (writer, reader) = gateway.split();
-	let write_fut = write(writer, command_recv, sequence.clone(), heartbeat_interval).fuse();
-	pin_mut!(write_fut);
-	let read_fut = read(reader, seed_send, guilds, meta, sequence, client).fuse();
-	pin_mut!(read_fut);
+	callback(GuildEvent::Online).await;
 
-	select! {
-		res = write_fut => res,
-		res = read_fut => res,
-	}
+	let res = {
+		let (writer, reader) = gateway.split();
+		let write_fut = write(writer, command_recv, sequence.clone(), heartbeat_interval).fuse();
+		pin_mut!(write_fut);
+		let read_fut = read(reader, callback, session_id, sequence).fuse();
+		pin_mut!(read_fut);
+
+		select! {
+			res = write_fut => res,
+			res = read_fut => res,
+		}
+	};
+
+	callback(GuildEvent::Offline).await;
+
+	res
 }
 
 async fn write(
 	mut gateway: SplitSink<Gateway, Command>,
-	command_recv: &mut Recv<Command>,
+	command_recv: &mut Receiver<Command>,
 	sequence: Arc<AtomicU64>,
 	heartbeat_interval: Duration,
 ) -> Result<Never, GatewayError> {
@@ -260,13 +240,11 @@ async fn write(
 	Err(GatewayError::Close(None))
 }
 
-async fn read(
+async fn read<F: Callback<G>, G: Fut>(
 	mut gateway: SplitStream<Gateway>,
-	seed_send: &mut Send<Seed>,
-	guilds: &mut Guilds,
-	meta: &mut Meta,
+	callback: &mut F,
+	session_id: &mut Option<String>,
 	sequence: Arc<AtomicU64>,
-	client: Client,
 ) -> Result<Never, GatewayError> {
 	while let Some(event) = gateway.next().await {
 		let event = match event {
@@ -283,7 +261,16 @@ async fn read(
 			}
 		};
 
-		use Event::*;
+		if event.is_invalid_session() {
+			// Our session was invalidated, don't try to resume it during our next connection
+			warn!("Session invalidated");
+			*session_id = None;
+			break;
+		}
+
+		callback(GuildEvent::Event(event)).await;
+
+		/*use Event::*;
 		if let GuildCreate(gc) = &event {
 			if meta.application.is_none() {
 				warn!("Received guild before being ready");
@@ -337,7 +324,7 @@ async fn read(
 			InvalidSession(_) => {
 				// Our session was invalidated, don't try to resume it during our next connection
 				warn!("Session invalidated, starting a new one..");
-				meta.session_id = None;
+				*session_id = None;
 				break;
 			}
 			HeartbeatAck => {
@@ -347,22 +334,9 @@ async fn read(
 				// Should not be reachable unless server breaks protocol
 			}
 			Unknown(_) | _ => {}
-		}
+		}*/
 	}
 
 	debug!("Reader shutdown");
 	Err(GatewayError::Close(None))
-}
-
-fn send_or_drop<T, U: Into<T>>(send: &mut Option<Send<T>>, item: U) {
-	if let Some(s) = send {
-		match s.try_send(item.into()) {
-			Err(e) if e.is_disconnected() => {
-				debug!("Channel closed");
-				*send = None;
-			}
-			Err(e) if e.is_full() => warn!("Channel full"),
-			_ => {}
-		}
-	}
 }

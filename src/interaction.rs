@@ -9,11 +9,11 @@ use std::future::Future;
 use tokio::task::JoinHandle;
 
 pub trait CanRespond {
-	fn respond(&self, guild: &Guild) -> ResponseBuilder;
+	fn respond<S>(&self, guild: &Guild<S>) -> ResponseBuilder;
 }
 
 impl CanRespond for Interaction {
-	fn respond(&self, guild: &Guild) -> ResponseBuilder {
+	fn respond<S>(&self, guild: &Guild<S>) -> ResponseBuilder {
 		ResponseBuilder::new(self, guild.client())
 	}
 }

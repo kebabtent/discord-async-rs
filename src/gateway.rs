@@ -107,6 +107,13 @@ impl<'a> Connector<'a> {
 		}
 	}
 
+	pub fn is_new(&self) -> bool {
+		match self.token {
+			Token::New(_) => true,
+			_ => false,
+		}
+	}
+
 	pub fn properties(mut self, properties: command::ConnectionProperties) -> Self {
 		self.properties = Some(properties);
 		self

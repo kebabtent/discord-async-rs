@@ -1,46 +1,14 @@
-use crate::{Client, Error, Recv};
+use crate::{Client, Error};
 use discord_types::event;
 use discord_types::{
 	ApplicationCommand, ApplicationId, Channel, ChannelId, Event, GuildId, Member, Role, RoleId,
 	UserId,
 };
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use log::{debug, info};
 use std::collections::HashMap;
 
-pub struct GuildSeed {
-	guild_create: event::GuildCreate,
-	client: Client,
-	event_recv: Recv<GuildEvent>,
-}
-
-impl GuildSeed {
-	pub(crate) fn new(
-		guild_create: event::GuildCreate,
-		client: Client,
-		event_recv: Recv<GuildEvent>,
-	) -> Self {
-		Self {
-			guild_create,
-			client,
-			event_recv,
-		}
-	}
-
-	pub fn id(&self) -> GuildId {
-		self.guild_create.guild.id
-	}
-
-	pub fn name(&self) -> &str {
-		&self.guild_create.guild.name
-	}
-
-	fn inner(self) -> (event::GuildCreate, Client, Recv<GuildEvent>) {
-		(self.guild_create, self.client, self.event_recv)
-	}
-}
-
-pub struct Guild {
+pub struct Guild<S> {
 	id: GuildId,
 	user_id: UserId,
 	application_id: ApplicationId,
@@ -51,37 +19,11 @@ pub struct Guild {
 	member_count: usize,
 	members: HashMap<UserId, Member>,
 	commands: HashMap<String, ApplicationCommand>,
-	recv: Recv<GuildEvent>,
+	stream: S,
 	client: Client,
 }
 
-impl Guild {
-	pub(crate) async fn new(
-		seed: GuildSeed,
-		user_id: UserId,
-		application_id: ApplicationId,
-	) -> Result<Self, Error> {
-		let (gc, client, recv) = seed.inner();
-
-		let mut guild = Self {
-			id: gc.guild.id,
-			user_id,
-			application_id,
-			name: gc.guild.name.clone(),
-			available: false,
-			channels: HashMap::new(),
-			roles: HashMap::new(),
-			member_count: 0,
-			members: HashMap::new(),
-			commands: HashMap::new(),
-			recv,
-			client,
-		};
-		guild.load_commands().await?;
-		guild.update(gc.guild);
-		Ok(guild)
-	}
-
+impl<S> Guild<S> {
 	pub fn client(&self) -> Client {
 		self.client.clone()
 	}
@@ -188,15 +130,42 @@ impl Guild {
 	pub fn command(&self, name: &str) -> Option<&ApplicationCommand> {
 		self.commands.get(name)
 	}
+}
 
-	pub async fn next_stateless(&mut self) -> Option<GuildEvent> {
-		self.recv.next().await
+impl<S> Guild<S>
+where
+	S: Stream<Item = GuildEvent> + Unpin + Sync + Send + 'static,
+{
+	pub(crate) async fn new(
+		stream: S,
+		gc: event::GuildCreate,
+		client: Client,
+		user_id: UserId,
+		application_id: ApplicationId,
+	) -> Result<Self, Error> {
+		let mut guild = Self {
+			id: gc.guild.id,
+			user_id,
+			application_id,
+			name: gc.guild.name.clone(),
+			available: false,
+			channels: HashMap::new(),
+			roles: HashMap::new(),
+			member_count: 0,
+			members: HashMap::new(),
+			commands: HashMap::new(),
+			stream,
+			client,
+		};
+		guild.load_commands().await?;
+		guild.update(gc.guild);
+		Ok(guild)
 	}
 
 	pub async fn next(&mut self) -> Option<GuildEvent> {
 		// Some `GuildEvent`s might not be forwarded, so we loop until we get one
 		loop {
-			let event = match self.recv.next().await? {
+			let event = match self.stream.next().await? {
 				GuildEvent::Event(e) => e,
 				x => return Some(x),
 			};
