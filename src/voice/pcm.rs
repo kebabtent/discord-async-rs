@@ -1,7 +1,7 @@
 use super::{EncodeError, FRAME_LENGTH_MS, SAMPLE_RATE};
 use bytes::{Bytes, BytesMut};
 use futures::Stream;
-use tokio_util::codec::{Decoder, FramedRead};
+use tokio_util::codec::Decoder;
 
 pub struct PcmFrame(Bytes);
 

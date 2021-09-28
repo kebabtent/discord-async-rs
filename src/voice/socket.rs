@@ -1,10 +1,10 @@
 use super::opus::OpusFrame;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use futures::channel::mpsc;
+use futures::channel::{mpsc, oneshot};
 use futures::future::select;
 use futures::pin_mut;
 use futures::{SinkExt, StreamExt};
-use log::{debug, warn};
+use log::debug;
 use std::error::Error;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
@@ -16,49 +16,30 @@ use xsalsa20poly1305::aead::{AeadInPlace, NewAead};
 use xsalsa20poly1305::XSalsa20Poly1305;
 
 pub type Listener = mpsc::Receiver<Event>;
-
-#[derive(Debug)]
-enum Control {
-	VoiceFrame(OpusFrame),
-	SecretKey([u8; 32]),
-}
-
-#[derive(Debug)]
-pub struct Controller {
-	inner: mpsc::Sender<Control>,
-}
-
-impl Controller {
-	pub async fn secret_key(&mut self, key: [u8; 32]) -> bool {
-		if let Err(e) = self.inner.send(Control::SecretKey(key)).await {
-			warn!("Controller: {}", e);
-			false
-		} else {
-			true
-		}
-	}
-
-	pub fn voice_frame(&mut self, frame: OpusFrame) -> bool {
-		self.inner.try_send(Control::VoiceFrame(frame)).is_ok()
-	}
-}
-
-impl From<mpsc::Sender<Control>> for Controller {
-	fn from(inner: mpsc::Sender<Control>) -> Self {
-		Self { inner }
-	}
-}
+pub type KeySender = oneshot::Sender<SecretKey>;
+pub type VoiceFrameSender = mpsc::Sender<OpusFrame>;
+type SecretKey = [u8; 32];
 
 #[derive(Clone, Debug)]
 pub enum Event {
 	AddrDiscovery(SocketAddr),
+	VoiceFrameSender(VoiceFrameSender),
 	VoiceFrame(usize),
+}
+
+impl Event {
+	pub fn is_voice_frame(&self) -> bool {
+		match self {
+			Event::VoiceFrame(_) => true,
+			_ => false,
+		}
+	}
 }
 
 pub struct Socket {
 	addr: SocketAddr,
 	ssrc: u32,
-	control_recv: mpsc::Receiver<Control>,
+	key_recv: oneshot::Receiver<SecretKey>,
 	event_send: mpsc::Sender<Event>,
 }
 
@@ -66,8 +47,9 @@ impl Socket {
 	pub fn new<T: ToSocketAddrs>(
 		addr: T,
 		ssrc: u32,
-	) -> std::io::Result<(Self, Controller, Listener)> {
-		let (controller, control_recv) = mpsc::channel(16);
+	) -> std::io::Result<(Self, KeySender, Listener)> {
+		debug!("New");
+		let (key_send, key_recv) = oneshot::channel();
 		let (event_send, event_recv) = mpsc::channel(16);
 		let addr = addr
 			.to_socket_addrs()?
@@ -77,10 +59,10 @@ impl Socket {
 		let socket = Self {
 			addr,
 			ssrc,
-			control_recv,
+			key_recv,
 			event_send,
 		};
-		Ok((socket, controller.into(), event_recv))
+		Ok((socket, key_send, event_recv))
 	}
 
 	async fn run(mut self) -> Result<(), Box<dyn Error>> {
@@ -115,7 +97,13 @@ impl Socket {
 		let addr = format!("{}:{}", ip, port).parse()?;
 		self.event_send.send(Event::AddrDiscovery(addr)).await?;
 
-		let writer = write(Arc::clone(&sock), self.ssrc, self.addr, self.control_recv);
+		let writer = write(
+			Arc::clone(&sock),
+			self.ssrc,
+			self.addr,
+			self.key_recv,
+			self.event_send.clone(),
+		);
 		pin_mut!(writer);
 		let reader = read(sock, self.event_send);
 		pin_mut!(reader);
@@ -149,11 +137,11 @@ async fn write(
 	sock: Arc<UdpSocket>,
 	ssrc: u32,
 	addr: SocketAddr,
-	mut control_recv: mpsc::Receiver<Control>,
+	key_recv: oneshot::Receiver<SecretKey>,
+	mut event_send: mpsc::Sender<Event>,
 ) -> Result<(), Box<dyn Error>> {
 	let mut sequence = 0u16;
 	let mut timestamp = 0u32;
-	let mut cipher = None;
 	let mut buf = Vec::<u8>::with_capacity(512);
 	let mut nonce = [0u8; 24];
 	let mut packet = [0u8; 512];
@@ -161,44 +149,38 @@ async fn write(
 	packet[1] = 0x78;
 	(&mut packet[8..12]).write_u32::<BigEndian>(ssrc)?;
 
-	while let Some(control) = control_recv.next().await {
-		match control {
-			Control::SecretKey(key) => {
-				// cipher = Some(Key::from_slice(&key).ok_or_else(|| "Invalid encryption key")?);
-				cipher = Some(
-					XSalsa20Poly1305::new_from_slice(&key).map_err(|_| "Invalid encryption key")?,
-				);
-			}
-			Control::VoiceFrame(frame) => {
-				if let Some(c) = &cipher {
-					// Copy data into buffer
-					buf.resize(frame.len(), 0);
-					buf.copy_from_slice(&frame);
+	let key = key_recv.await?;
+	let (frame_send, mut frame_recv) = mpsc::channel(16);
+	event_send.send(Event::VoiceFrameSender(frame_send)).await?;
+	let cipher = XSalsa20Poly1305::new_from_slice(&key).map_err(|_| "Invalid encryption key")?;
 
-					// Prepare packet
-					(&mut packet[2..4]).write_u16::<BigEndian>(sequence)?;
-					(&mut packet[4..8]).write_u32::<BigEndian>(timestamp)?;
+	while let Some(frame) = frame_recv.next().await {
+		// Copy data into buffer
+		buf.resize(frame.len(), 0);
+		buf.copy_from_slice(&frame);
 
-					// Prepare nonce
-					nonce[..12].copy_from_slice(&packet[..12]);
-					let n = GenericArray::from_slice(&nonce);
+		// Prepare packet
+		(&mut packet[2..4]).write_u16::<BigEndian>(sequence)?;
+		(&mut packet[4..8]).write_u32::<BigEndian>(timestamp)?;
 
-					// Encrypt
-					c.encrypt_in_place(n, &[], &mut buf)
-						.map_err(|_| "Encryption error")?;
-					let len = buf.len() + 12;
+		// Prepare nonce
+		nonce[..12].copy_from_slice(&packet[..12]);
+		let n = GenericArray::from_slice(&nonce);
 
-					// Copy encrypted data into packet
-					// TODO: use `encrypt_in_place_detached` to save some copying
-					packet[12..len].copy_from_slice(&buf);
-					let written = sock.send_to(&packet[..len], addr).await?;
-					debug_assert_eq!(written, len);
+		// Encrypt
+		cipher
+			.encrypt_in_place(n, &[], &mut buf)
+			.map_err(|_| "Encryption error")?;
+		let len = buf.len() + 12;
 
-					sequence = sequence.wrapping_add(1);
-					timestamp = timestamp.wrapping_add(960);
-				}
-			}
-		}
+		// Copy encrypted data into packet
+		// TODO: use `encrypt_in_place_detached` to save some copying
+		packet[12..len].copy_from_slice(&buf);
+		let written = sock.send_to(&packet[..len], addr).await?;
+		debug_assert_eq!(written, len);
+
+		sequence = sequence.wrapping_add(1);
+		timestamp = timestamp.wrapping_add(960);
 	}
 	Ok(())
 }

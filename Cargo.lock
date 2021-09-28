@@ -33,6 +33,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-fuse"
+version = "0.11.2"
+source = "git+https://github.com/kebabtent/async-fuse?branch=take#518c50add94ee023f93b3e097e4f857dcace699b"
+dependencies = [
+ "futures-core",
+]
+
+[[package]]
 name = "async-tungstenite"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -219,6 +227,7 @@ dependencies = [
 name = "discord-async"
 version = "0.1.0"
 dependencies = [
+ "async-fuse",
  "async-tungstenite",
  "bitflags",
  "byteorder",
@@ -243,7 +252,7 @@ dependencies = [
 [[package]]
 name = "discord-types"
 version = "0.1.0"
-source = "git+https://github.com/kebabtent/discord-types-rs#4e6f34e9a0b89f56b8bfa5824251dba9475dae00"
+source = "git+https://github.com/kebabtent/discord-types-rs#1c94519a53f05fb4de4cc007494a8de8f0db3313"
 dependencies = [
  "bitflags",
  "chrono",

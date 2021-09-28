@@ -1,32 +1,41 @@
-use crate::guild::{Guild, GuildEvent};
-use crate::{Client, Connector, Error, Gateway, GatewayError};
+use crate::guild::Guild;
+use crate::{Client, Connector, Error, Gateway, GatewayError, GatewayEvent};
 use discord_types::event::GuildCreate;
 use discord_types::{Application, ApplicationId, Command, Intents, User, UserId};
 use futures::channel::mpsc::Receiver;
 use futures::channel::{mpsc, oneshot};
-use futures::stream::{self, SplitSink, SplitStream};
-use futures::{pin_mut, select};
+use futures::pin_mut;
+use futures::stream::{SplitSink, SplitStream};
 use futures::{Future, FutureExt, SinkExt, Stream, StreamExt};
 use log::{debug, warn};
 use never::Never;
-use pin_project::pin_project;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::{task, time};
+use tokio::{select, task, time};
 use tokio_stream::wrappers::IntervalStream;
 
 type InitSend = oneshot::Sender<Init>;
 type Init = (Application, User);
+type ShutdownRecv = oneshot::Receiver<()>;
 
-trait Callback<G: Fut>: FnMut(GuildEvent) -> G + Send + Sync + 'static {}
-trait Fut: Future<Output = ()> {}
+trait Callback<G: Fut>: FnMut(GatewayEvent) -> G + Send + Sync {}
+trait Fut: Future<Output = Result<(), GatewayError>> {}
 
-impl<G> Fut for G where G: Future<Output = ()> + Send + Sync + 'static {}
+macro_rules! check_shutdown {
+	($recv:expr) => {
+		match $recv.try_recv() {
+			Ok(Some(_)) | Err(_) => break,
+			_ => {}
+		}
+	};
+}
+
+impl<G> Fut for G where G: Future<Output = Result<(), GatewayError>> + Send + Sync + 'static {}
 
 impl<F, G> Callback<G> for F
 where
-	F: FnMut(GuildEvent) -> G + Send + Sync + 'static,
+	F: FnMut(GatewayEvent) -> G + Send + Sync,
 	G: Fut,
 {
 }
@@ -66,8 +75,8 @@ impl<F> Builder<F> {
 
 impl<F, G> Builder<F>
 where
-	F: FnMut(GuildEvent) -> G + Send + Sync + 'static,
-	G: Future<Output = ()> + Send + Sync + 'static,
+	F: FnMut(Option<GatewayEvent>) -> G + Send + Sync + 'static,
+	G: Future<Output = Result<(), GatewayError>> + Send + Sync + 'static,
 {
 	pub fn new(token: String, callback: F) -> Self {
 		Self {
@@ -80,11 +89,13 @@ where
 	pub async fn build(self) -> Result<Discord, Error> {
 		let (command_send, command_recv) = mpsc::channel(8);
 		let (init_send, init_recv) = oneshot::channel();
+		let (shutdown_send, shutdown_recv) = oneshot::channel();
 		let client = Client::new(&self.token, command_send)?;
-		task::spawn(start_discord(
+		let handle = task::spawn(start_discord(
 			self.token,
 			self.intents,
 			init_send,
+			shutdown_recv,
 			self.callback,
 			command_recv,
 		));
@@ -97,15 +108,18 @@ where
 			application,
 			user,
 			client,
+			shutdown: Some(Shutdown(shutdown_send)),
+			handle,
 		})
 	}
 }
 
-#[pin_project]
 pub struct Discord {
 	application: Application,
 	user: User,
 	client: Client,
+	shutdown: Option<Shutdown>,
+	handle: task::JoinHandle<()>,
 }
 
 impl Discord {
@@ -121,7 +135,7 @@ impl Discord {
 		self.application.id
 	}
 
-	pub async fn guild<S: Stream<Item = GuildEvent> + Unpin + Sync + Send + 'static>(
+	pub async fn guild<S: Stream<Item = GatewayEvent> + Unpin + Sync + Send + 'static>(
 		&self,
 		stream: S,
 		gc: GuildCreate,
@@ -135,36 +149,62 @@ impl Discord {
 		)
 		.await
 	}
+
+	pub fn shutdown(&mut self) -> Option<Shutdown> {
+		self.shutdown.take()
+	}
+
+	pub fn handle(self) -> task::JoinHandle<()> {
+		self.handle
+	}
 }
 
-async fn start_discord<F: Callback<G>, G: Fut>(
+pub struct Shutdown(oneshot::Sender<()>);
+
+impl Shutdown {
+	pub fn send(self) -> bool {
+		self.0.send(()).is_ok()
+	}
+}
+
+async fn start_discord<F, G>(
 	token: String,
 	intents: Intents,
 	init_send: InitSend,
+	mut shutdown_recv: ShutdownRecv,
 	mut callback: F,
 	mut command_recv: Receiver<Command>,
-) {
+) where
+	F: FnMut(Option<GatewayEvent>) -> G + Send + Sync + 'static,
+	G: Future<Output = Result<(), GatewayError>> + Send + Sync + 'static,
+{
 	let mut session_id = None;
 	let sequence = Arc::new(AtomicU64::new(0));
 	let mut init_send = Some(init_send);
 
 	loop {
-		match connect(
+		let mut cb = |ev: GatewayEvent| callback(Some(ev));
+		check_shutdown!(shutdown_recv);
+		let err = connect(
 			&token,
 			intents,
 			&mut session_id,
 			sequence.clone(),
-			&mut callback,
+			&mut cb,
 			&mut init_send,
+			&mut shutdown_recv,
 			&mut command_recv,
 		)
 		.await
-		{
-			Ok(_) => unreachable!(),
-			Err(e) => warn!("Connection error: {:?}", e),
+		.unwrap_err();
+		warn!("Connection error: {:?}", err);
+		if err.is_shutdown() {
+			break;
 		}
+		check_shutdown!(shutdown_recv);
 		time::sleep(Duration::from_secs(3)).await; // TODO: exponential backoff?
 	}
+	callback(None);
 }
 
 async fn connect<F: Callback<G>, G: Fut>(
@@ -174,6 +214,7 @@ async fn connect<F: Callback<G>, G: Fut>(
 	sequence: Arc<AtomicU64>,
 	callback: &mut F,
 	init_send: &mut Option<InitSend>,
+	shutdown_recv: &mut ShutdownRecv,
 	command_recv: &mut Receiver<Command>,
 ) -> Result<Never, GatewayError> {
 	let connector = match session_id.as_deref() {
@@ -182,27 +223,37 @@ async fn connect<F: Callback<G>, G: Fut>(
 	};
 	let is_new = connector.is_new();
 
-	let (gateway, heartbeat_interval, ready) = connector.connect().await?;
-	if let Some(init_send) = init_send.take() {
-		match ready {
-			Some(ready) => {
-				let _ = init_send.send((ready.application, ready.user));
-			}
-			None => {
-				if is_new {
-					return Err(GatewayError::UnexpectedEvent);
-				}
-			}
+	let (gateway, heartbeat_interval, event) = connector.connect().await?;
+	if is_new {
+		let ready = event.expect_ready()?;
+		*session_id = Some(ready.session_id.clone());
+		if let Some(init_send) = init_send.take() {
+			let _ = init_send.send((ready.application, ready.user));
 		}
+		callback(GatewayEvent::Online).await?;
+	} else {
+		if event.is_invalid_session() {
+			warn!("Session invalidated");
+			*session_id = None;
+			callback(GatewayEvent::SessionInvalidated).await?;
+			return Err(GatewayError::Close(None));
+		}
+		callback(GatewayEvent::Online).await?;
+		callback(GatewayEvent::Event(event)).await?;
 	}
 
-	callback(GuildEvent::Online).await;
-
+	let (mut writer, mut reader) = gateway.split();
 	let res = {
-		let (writer, reader) = gateway.split();
-		let write_fut = write(writer, command_recv, sequence.clone(), heartbeat_interval).fuse();
+		let write_fut = write(
+			&mut writer,
+			shutdown_recv,
+			command_recv,
+			sequence.clone(),
+			heartbeat_interval,
+		)
+		.fuse();
 		pin_mut!(write_fut);
-		let read_fut = read(reader, callback, session_id, sequence).fuse();
+		let read_fut = read(&mut reader, callback, sequence).fuse();
 		pin_mut!(read_fut);
 
 		select! {
@@ -210,40 +261,60 @@ async fn connect<F: Callback<G>, G: Fut>(
 			res = read_fut => res,
 		}
 	};
-
-	callback(GuildEvent::Offline).await;
-
-	res
+	let err = res.unwrap_err();
+	if err.is_shutdown() {
+		let mut gateway = reader.reunite(writer).unwrap();
+		let _ = gateway.shutdown().await;
+		return Err(err);
+	}
+	callback(GatewayEvent::Offline).await?;
+	Err(err)
 }
 
 async fn write(
-	mut gateway: SplitSink<Gateway, Command>,
+	gateway: &mut SplitSink<Gateway, Command>,
+	mut shutdown_recv: &mut ShutdownRecv,
 	command_recv: &mut Receiver<Command>,
 	sequence: Arc<AtomicU64>,
 	heartbeat_interval: Duration,
 ) -> Result<Never, GatewayError> {
-	let heartbeat = IntervalStream::new(time::interval_at(
+	let mut shutdown = false;
+	let mut heartbeat = IntervalStream::new(time::interval_at(
 		time::Instant::now() + heartbeat_interval,
 		heartbeat_interval,
-	))
-	.map(|_| Command::heartbeat(sequence.load(Ordering::Relaxed)));
+	));
 
-	let mut stream = stream::select(command_recv, heartbeat);
-
-	// Write any upstream commands and a periodic heartbeat to the gateway
-	while let Some(item) = stream.next().await {
+	loop {
+		let item = select! {
+			_ = heartbeat.next() => {
+				Command::heartbeat(sequence.load(Ordering::Relaxed))
+			}
+			item = command_recv.next() => {
+				match item {
+					Some(c) => c,
+					None => break,
+				}
+			}
+			_ = &mut shutdown_recv => {
+				command_recv.close();
+				shutdown = true;
+				continue;
+			}
+		};
 		gateway.send(item).await?;
 	}
-	gateway.close().await?;
 
 	debug!("Writer shutdown");
-	Err(GatewayError::Close(None))
+	if shutdown {
+		Err(GatewayError::Shutdown)
+	} else {
+		Err(GatewayError::Close(None))
+	}
 }
 
 async fn read<F: Callback<G>, G: Fut>(
-	mut gateway: SplitStream<Gateway>,
+	gateway: &mut SplitStream<Gateway>,
 	callback: &mut F,
-	session_id: &mut Option<String>,
 	sequence: Arc<AtomicU64>,
 ) -> Result<Never, GatewayError> {
 	while let Some(event) = gateway.next().await {
@@ -261,80 +332,7 @@ async fn read<F: Callback<G>, G: Fut>(
 			}
 		};
 
-		if event.is_invalid_session() {
-			// Our session was invalidated, don't try to resume it during our next connection
-			warn!("Session invalidated");
-			*session_id = None;
-			break;
-		}
-
-		callback(GuildEvent::Event(event)).await;
-
-		/*use Event::*;
-		if let GuildCreate(gc) = &event {
-			if meta.application.is_none() {
-				warn!("Received guild before being ready");
-				break;
-			}
-
-			let guild_id = gc.guild.id;
-			let unavailable = gc.guild.unavailable.unwrap_or(true);
-
-			if !guilds.contains_key(&guild_id) {
-				// 'New' guild (not yet known)
-				let (send, recv) = mpsc::channel(16);
-				guilds.insert(guild_id, (false, Some(send)));
-				let seed = GuildSeed::new(gc.clone(), client.clone(), recv);
-				let _ = seed_send.try_send(Seed::Guild(seed));
-			}
-
-			let (available, send) = guilds.get_mut(&guild_id).unwrap();
-			if *available == unavailable {
-				// Availability toggled, notify guild
-				*available = !unavailable;
-				let event = if unavailable {
-					GuildEvent::Offline
-				} else {
-					GuildEvent::Online
-				};
-				send_or_drop(send, event);
-			}
-		}
-
-		// Dispatch guild events to the appropriate channel
-		if let Some(guild_id) = event.guild_id() {
-			if let Some((_, send)) = guilds.get_mut(&guild_id) {
-				send_or_drop(send, event);
-			} else {
-				warn!("Message for unknown guild {}", guild_id);
-			}
-			continue;
-		}
-
-		match event {
-			Resumed => {
-				// Resume: guilds are online again
-				info!("Resumed session");
-				for (available, send) in guilds.values_mut() {
-					if *available {
-						send_or_drop(send, GuildEvent::Online);
-					}
-				}
-			}
-			InvalidSession(_) => {
-				// Our session was invalidated, don't try to resume it during our next connection
-				warn!("Session invalidated, starting a new one..");
-				*session_id = None;
-				break;
-			}
-			HeartbeatAck => {
-				// TODO: detect dead connection
-			}
-			Ready(_) | Hello(_) => {
-				// Should not be reachable unless server breaks protocol
-			}
-			Unknown(_) | _ => {}
-		}*/
+		callback(GatewayEvent::Event(event)).await?;
 	}
 
 	debug!("Reader shutdown");

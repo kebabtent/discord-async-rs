@@ -7,7 +7,7 @@ use discord_types::{GuildId, SpeakingFlags, UserId};
 use futures::channel::mpsc;
 use futures::future::join;
 use futures::stream::{FusedStream, SplitSink, SplitStream};
-use futures::{pin_mut, select, FutureExt};
+use futures::{select, FutureExt};
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use log::{debug, info, warn};
 use pin_project::pin_project;
@@ -44,6 +44,15 @@ macro_rules! read_command {
 			None => return Err(GatewayError::Ws(tungstenite::Error::ConnectionClosed).into()),
 		}
 	};
+}
+
+#[derive(Clone, Debug)]
+pub struct Credentials {
+	pub guild_id: GuildId,
+	pub user_id: UserId,
+	pub session_id: String,
+	pub token: String,
+	pub endpoint: String,
 }
 
 #[derive(Debug)]
@@ -93,14 +102,6 @@ impl From<mpsc::Sender<Command>> for Controller {
 	}
 }
 
-pub struct ConnectParams {
-	pub guild_id: GuildId,
-	pub user_id: UserId,
-	pub session_id: CowString,
-	pub token: CowString,
-	pub endpoint: CowString,
-}
-
 #[pin_project]
 pub struct Gateway {
 	#[pin]
@@ -110,16 +111,18 @@ pub struct Gateway {
 
 impl Gateway {
 	async fn connect(
-		params: ConnectParams,
+		cred: Credentials,
 		resume: bool,
 	) -> Result<(Self, Duration, Option<Ready>), Box<dyn Error>> {
-		let ConnectParams {
+		let Credentials {
 			guild_id,
 			user_id,
 			session_id,
 			token,
 			endpoint,
-		} = params;
+		} = cred;
+		let session_id = session_id.into();
+		let token = token.into();
 
 		let url = format!(
 			"wss://{}/?v={}",
@@ -129,7 +132,8 @@ impl Gateway {
 		info!("Connecting to voice gateway v{} ", API_VERSION);
 
 		let codec = Box::new(JsonCodec::new(Some("vgw.log")));
-		let (mut conn, _) = Connection::<Command, Event>::connect(url, codec).await?;
+		let (mut conn, _) =
+			Connection::<Command, Event>::connect(url, codec, Duration::from_secs(5)).await?;
 
 		// Receive `Hello`
 		let hello = read_command!(conn, expect_hello);
@@ -170,11 +174,12 @@ impl Gateway {
 		))
 	}
 
-	pub fn spawn(params: ConnectParams, resume: bool) -> (Controller, Listener) {
+	pub fn spawn(cred: Credentials, resume: bool) -> (Controller, Listener) {
+		debug!("New");
 		let (controller, command_recv) = mpsc::channel(16);
 		let (event_send, event_recv) = mpsc::channel(16);
 		tokio::spawn(async move {
-			if let Err(e) = connect(params, resume, command_recv, event_send).await {
+			if let Err(e) = connect(cred, resume, command_recv, event_send).await {
 				debug!("Closed: {}", e);
 			} else {
 				debug!("Closed");
@@ -232,12 +237,12 @@ impl Sink<Command> for Gateway {
 }
 
 async fn connect(
-	params: ConnectParams,
+	cred: Credentials,
 	resume: bool,
 	command_recv: mpsc::Receiver<Command>,
 	mut event_send: mpsc::Sender<Event>,
 ) -> Result<(), Box<dyn Error>> {
-	let (gateway, heartbeat_interval, ready) = Gateway::connect(params, resume).await?;
+	let (gateway, heartbeat_interval, ready) = Gateway::connect(cred, resume).await?;
 	if let Some(ready) = ready {
 		debug!("Sending ready event");
 		let _ = event_send.send(Event::Ready(ready)).await;

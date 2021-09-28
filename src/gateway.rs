@@ -1,4 +1,5 @@
 use crate::codec::{Codec, Connection, JsonCodec};
+use crate::GatewayError;
 use async_tungstenite::tungstenite;
 use discord_types::event::EventError;
 use discord_types::{command, event};
@@ -16,19 +17,32 @@ const API_VERSION: u8 = 8;
 
 #[derive(Debug)]
 pub enum Error {
+	Shutdown,
 	Ws(tungstenite::Error),
 	UnexpectedEvent,
+	Timeout,
 	Close(Option<tungstenite::protocol::CloseFrame<'static>>),
 	Decode,
 	Serde(serde_json::Error),
+}
+
+impl Error {
+	pub fn is_shutdown(&self) -> bool {
+		match self {
+			Error::Shutdown => true,
+			_ => false,
+		}
+	}
 }
 
 impl fmt::Display for Error {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		use Error::*;
 		match self {
+			Shutdown => write!(f, "Shutdown"),
 			Ws(e) => fmt::Display::fmt(e, f),
 			UnexpectedEvent => write!(f, "Unexpected event"),
+			Timeout => write!(f, "Connection timed out"),
 			Close(Some(frame)) => write!(f, "Connection closed: {}", frame),
 			Close(None) => write!(f, "Connection closed"),
 			Decode => write!(f, "Decode error"),
@@ -57,10 +71,10 @@ impl From<serde_json::Error> for Error {
 	}
 }
 
-macro_rules! read_command {
-	($conn:expr, $fnc:ident) => {
+macro_rules! read_event {
+	($conn:expr) => {
 		match $conn.next().await {
-			Some(Ok(payload)) => payload.event.$fnc()?,
+			Some(Ok(payload)) => payload.event,
 			Some(Err(e)) => return Err(e.into()),
 			None => return Err(Error::Ws(tungstenite::Error::ConnectionClosed)),
 		}
@@ -129,7 +143,7 @@ impl<'a> Connector<'a> {
 		self
 	}
 
-	pub async fn connect(self) -> Result<(Gateway, Duration, Option<event::Ready>), Error> {
+	pub async fn connect(self) -> Result<(Gateway, Duration, event::Event), Error> {
 		let encoder = match self.encoding {
 			Encoding::Json => {
 				let file = if cfg!(debug_assertions) {
@@ -150,10 +164,10 @@ impl<'a> Connector<'a> {
 			self.version, self.encoding
 		);
 
-		let (mut conn, _) = Connection::connect(url, encoder).await?;
+		let (mut conn, _) = Connection::connect(url, encoder, Duration::from_secs(5)).await?;
 
 		// Receive `Hello`
-		let hello = read_command!(conn, expect_hello);
+		let hello = read_event!(conn).expect_hello()?;
 
 		let msg = match self.token {
 			Token::New(token) => {
@@ -192,14 +206,12 @@ impl<'a> Connector<'a> {
 		// Send `Identify`/`Resume`
 		conn.send(msg).await?;
 
-		let ready = if let Token::New(_) = self.token {
-			// Receive `Ready`
-			let ready = read_command!(conn, expect_ready);
-			debug!("Handshake complete");
-			Some(ready)
-		} else {
-			None
-		};
+		// We always expect to receive a message here. There are multiple possibilities.
+		// For a new session we expect a `Ready`. For a resumed session we expect one of
+		// - `InvalidSession`
+		// - The first missed event since our disconnect
+		// - `Resumed` if there are no missed events
+		let event = read_event!(conn);
 
 		let gateway = Gateway {
 			conn,
@@ -209,7 +221,7 @@ impl<'a> Connector<'a> {
 		Ok((
 			gateway,
 			Duration::from_millis(hello.heartbeat_interval),
-			ready,
+			event,
 		))
 	}
 }
@@ -228,11 +240,36 @@ impl fmt::Display for Encoding {
 	}
 }
 
+pub enum GatewayEvent {
+	Offline,
+	Online,
+	SessionInvalidated,
+	Event(event::Event),
+}
+
+impl From<event::Event> for GatewayEvent {
+	fn from(event: event::Event) -> Self {
+		GatewayEvent::Event(event)
+	}
+}
+
+impl From<event::GuildCreate> for GatewayEvent {
+	fn from(gc: event::GuildCreate) -> Self {
+		GatewayEvent::Event(event::Event::GuildCreate(gc))
+	}
+}
+
 #[pin_project]
 pub struct Gateway {
 	#[pin]
 	conn: Connection<Command, Payload>,
 	finished: bool,
+}
+
+impl Gateway {
+	pub async fn shutdown(&mut self) -> Result<(), GatewayError> {
+		self.conn.shutdown().await
+	}
 }
 
 // A fused `Connection`

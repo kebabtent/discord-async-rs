@@ -4,7 +4,6 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use bytes::{Bytes, BytesMut};
 use futures::stream::FusedStream;
 use futures::{ready, Future, Stream};
-use log::debug;
 use pin_project::pin_project;
 use std::fmt;
 use std::io::Cursor;
@@ -123,8 +122,7 @@ impl Stream for OpusEncoder {
 
 #[pin_project]
 pub struct OpusStream {
-	#[pin]
-	delay: Sleep,
+	delay: Pin<Box<Sleep>>,
 	deadline: Instant,
 	duration: Duration,
 	has_delayed: bool,
@@ -139,15 +137,17 @@ impl OpusStream {
 		let encoder = OpusEncoder::new(source, bitrate)?;
 		let duration = Duration::from_millis(FRAME_LENGTH_MS as u64);
 		let deadline = Instant::now();
-		Ok(Self {
-			delay: sleep_until(deadline),
+		let stream = Self {
+			delay: Box::pin(sleep_until(deadline)),
 			deadline,
 			duration,
 			has_delayed: false,
 			encoder,
 			silence_frames: SILENCE_FRAME_COUNT,
 			done: false,
-		})
+		};
+		assert_unpin(&stream);
+		Ok(stream)
 	}
 }
 
@@ -155,8 +155,7 @@ impl Stream for OpusStream {
 	type Item = Result<OpusFrame, EncodeError>;
 
 	fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-		let mut this = self.project();
-
+		let this = self.project();
 		if *this.done {
 			return Ready(None);
 		}
@@ -184,7 +183,7 @@ impl Stream for OpusStream {
 		let passed = now - *this.deadline;
 		let micros = this.duration.as_micros().saturating_sub(passed.as_micros()) as u64;
 		let deadline = now + Duration::from_micros(micros);
-		this.delay.reset(deadline);
+		this.delay.as_mut().reset(deadline);
 		*this.deadline = deadline;
 
 		Ready(Some(val.map(|v| OpusFrame(v))))
@@ -202,6 +201,8 @@ impl fmt::Debug for OpusStream {
 		f.debug_struct("OpusStream").finish()
 	}
 }
+
+fn assert_unpin<T: Unpin>(_t: &T) {}
 
 #[cfg(test)]
 mod tests {
@@ -235,12 +236,12 @@ mod tests {
 		assert_eq!(size * 400, bitrate as usize); // 8(bit->byte)/20(frame length ms)*1000(ms->s)
 	}*/
 
-	#[tokio::test]
+	/*#[tokio::test]
 	async fn encoder() {
 		let bitrate = 96_000;
 		let source = PcmFile::new("../ma.pcm", true).await.unwrap();
 		let mut enc = OpusEncoder::new(source, bitrate).unwrap();
 		let frame = enc.next().await.unwrap().unwrap();
 		assert_eq!(frame.len(), bitrate as usize / 400);
-	}
+	}*/
 }

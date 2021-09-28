@@ -1,13 +1,12 @@
 use crate::voice::pcm::{frame_sample_size, PcmCodec, PcmFrame, PcmStream};
 use crate::voice::{EncodeError, OpusStream};
-use bytes::BytesMut;
-use futures::{Stream, StreamExt};
+use futures::Stream;
 use pin_project::pin_project;
 use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::fs::File;
-use tokio_util::codec::{Decoder, FramedRead};
+use tokio_util::codec::FramedRead;
 
 #[pin_project]
 pub struct PcmFile {

@@ -6,8 +6,8 @@ use std::fmt;
 
 mod connection;
 mod gateway;
-mod opus;
-mod pcm;
+pub mod opus;
+pub mod pcm;
 mod player;
 mod socket;
 pub mod source;

@@ -1,4 +1,5 @@
-use crate::{Client, Error};
+use crate::voice;
+use crate::{Client, Error, GatewayEvent};
 use discord_types::event;
 use discord_types::{
 	ApplicationCommand, ApplicationId, Channel, ChannelId, Event, GuildId, Member, Role, RoleId,
@@ -89,6 +90,13 @@ impl<S> Guild<S> {
 		self.available
 	}
 
+	pub fn create_player(&self) -> (voice::Updater, voice::Controller, voice::Listener) {
+		let (player, updater, controller, listener) =
+			voice::Player::new(self.id, self.user_id, self.client.clone());
+		player.spawn();
+		(updater, controller, listener)
+	}
+
 	pub fn channels(&self) -> impl Iterator<Item = &Channel> {
 		self.channels.values()
 	}
@@ -134,7 +142,7 @@ impl<S> Guild<S> {
 
 impl<S> Guild<S>
 where
-	S: Stream<Item = GuildEvent> + Unpin + Sync + Send + 'static,
+	S: Stream<Item = GatewayEvent> + Unpin + Sync + Send + 'static,
 {
 	pub(crate) async fn new(
 		stream: S,
@@ -162,11 +170,11 @@ where
 		Ok(guild)
 	}
 
-	pub async fn next(&mut self) -> Option<GuildEvent> {
-		// Some `GuildEvent`s might not be forwarded, so we loop until we get one
+	pub async fn next(&mut self) -> Option<GatewayEvent> {
+		// Some `GatewayEvent`s might not be forwarded, so we loop until we get one
 		loop {
 			let event = match self.stream.next().await? {
-				GuildEvent::Event(e) => e,
+				GatewayEvent::Event(e) => e,
 				x => return Some(x),
 			};
 
@@ -299,25 +307,7 @@ where
 				| e @ Unknown(_) => e,
 			};
 
-			return Some(GuildEvent::Event(event));
+			return Some(GatewayEvent::Event(event));
 		}
-	}
-}
-
-pub enum GuildEvent {
-	Offline,
-	Online,
-	Event(Event),
-}
-
-impl From<Event> for GuildEvent {
-	fn from(event: Event) -> Self {
-		GuildEvent::Event(event)
-	}
-}
-
-impl From<event::GuildCreate> for GuildEvent {
-	fn from(gc: event::GuildCreate) -> Self {
-		GuildEvent::Event(Event::GuildCreate(gc))
 	}
 }

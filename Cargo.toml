@@ -14,6 +14,7 @@ voice = ["byteorder", "opus", "xsalsa20poly1305"]
 #voice = ["byteorder", "opus", "sodiumoxide"]
 
 [dependencies]
+async-fuse = { git = "https://github.com/kebabtent/async-fuse", branch = "take", features = ["stream"] }
 async-tungstenite = { version = "0.13", features = ["tokio-rustls"] }
 bitflags = "1.2"
 byteorder = { version = "1.4", optional = true}

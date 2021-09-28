@@ -2,8 +2,8 @@ pub use crate::client::{
 	ButtonComponent, Client, Error as ClientError, OptionalResult, RowComponent,
 };
 pub use crate::discord::{Builder, Discord};
-pub use crate::gateway::{Connector, Error as GatewayError, Gateway};
-pub use crate::guild::{Guild, GuildEvent};
+pub use crate::gateway::{Connector, Error as GatewayError, Gateway, GatewayEvent};
+pub use crate::guild::Guild;
 pub use discord_types as types;
 use serde::Deserialize;
 use std::fmt;

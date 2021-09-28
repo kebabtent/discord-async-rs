@@ -8,6 +8,8 @@ use futures::{Sink, Stream};
 use pin_project::pin_project;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::time;
 use tungstenite::client::IntoClientRequest;
 use tungstenite::handshake::client::Response;
 use tungstenite::Message;
@@ -30,13 +32,26 @@ impl<S, D> Connection<S, D> {
 	pub async fn connect<R>(
 		request: R,
 		codec: Box<dyn Codec<S, D>>,
+		timeout: Duration,
 	) -> Result<(Self, Response), GatewayError>
 	where
 		R: IntoClientRequest + Unpin,
 	{
-		let (conn, res) = connect_async(request).await?;
+		let (conn, res) = time::timeout(timeout, connect_async(request))
+			.await
+			.map_err(|_| GatewayError::Timeout)??;
 		let conn = Self { conn, codec };
 		Ok((conn, res))
+	}
+
+	pub async fn shutdown(&mut self) -> Result<(), GatewayError> {
+		use tungstenite::protocol::frame;
+		let frame = frame::CloseFrame {
+			code: frame::coding::CloseCode::Normal,
+			reason: "shutdown".into(),
+		};
+		self.conn.close(Some(frame)).await?;
+		Ok(())
 	}
 }
 
