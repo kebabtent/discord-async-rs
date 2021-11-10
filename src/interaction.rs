@@ -74,6 +74,11 @@ impl ResponseBuilder {
 		self
 	}
 
+	pub fn component_rows<T: IntoIterator<Item = RowComponent>>(mut self, rows: T) -> Self {
+		self.rows = Some(rows.into_iter().collect());
+		self
+	}
+
 	pub fn component_row(mut self, row: RowComponent) -> Self {
 		self.rows.get_or_insert_with(|| Vec::new()).push(row);
 		self
