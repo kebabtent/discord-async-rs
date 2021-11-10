@@ -8,7 +8,7 @@ pub use discord_types as types;
 use serde::Deserialize;
 use std::fmt;
 
-mod client;
+pub mod client;
 mod codec;
 mod discord;
 mod gateway;

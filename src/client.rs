@@ -457,6 +457,12 @@ impl<'a> CreateMessageBuilder<'a> {
 		cm
 	}
 
+	pub fn embed(self, embed: Embed) -> CreateMessage<'a> {
+		let mut cm = self.into();
+		cm.cm.embeds.push(embed);
+		cm
+	}
+
 	pub fn embeds<I: IntoIterator<Item = Embed>>(self, embeds: I) -> CreateMessage<'a> {
 		let mut cm = self.into();
 		cm.cm.embeds = embeds.into_iter().collect();
@@ -484,6 +490,11 @@ impl<'a> CreateMessage<'a> {
 
 	pub fn attachment(mut self, attachment: request::Attachment) -> Self {
 		self.attachment = Some(attachment);
+		self
+	}
+
+	pub fn component_rows<T: IntoIterator<Item = RowComponent>>(mut self, rows: T) -> Self {
+		self.cm.components = rows.into_iter().map(|r| r.component).collect();
 		self
 	}
 
@@ -537,6 +548,11 @@ impl<'a> EditMessage<'a> {
 
 	pub fn embed(mut self, embed: Embed) -> Self {
 		self.em.embeds.get_or_insert_with(|| Vec::new()).push(embed);
+		self
+	}
+
+	pub fn component_rows<T: IntoIterator<Item = RowComponent>>(mut self, rows: T) -> Self {
+		self.em.components = Some(rows.into_iter().map(|r| r.component).collect());
 		self
 	}
 
