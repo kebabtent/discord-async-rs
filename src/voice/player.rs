@@ -311,7 +311,7 @@ impl Player {
 			}
 			_ => {}
 		}
-		if self.state.is_connecting() && !self.conn_event_recv.is_empty() {
+		if self.state.is_connecting() && self.conn_event_recv.is_empty() {
 			if let Some(cred) = self.server_credentials() {
 				debug!("Spawn new connection");
 				let (conn, event_recv) = Connection::new(cred);
