@@ -3,8 +3,8 @@ use discord_types::command::{RequestGuildMembers, UpdateVoiceState};
 use discord_types::request;
 use discord_types::{
 	AllowedMentions, ApplicationCommand, ApplicationCommandOption, ApplicationId, ButtonStyle,
-	ChannelId, Command, Component, ComponentEmoji, ComponentType, Embed, GuildId, InteractionId,
-	InteractionResponseType, Member, Message, MessageId, RoleId, UserId,
+	ChannelId, Command, Component, ComponentType, Embed, GuildId, InteractionId,
+	InteractionResponseType, Member, Message, MessageId, PartialEmoji, RoleId, User, UserId,
 };
 use futures::channel::mpsc;
 use reqwest::multipart::{Form, Part};
@@ -132,11 +132,11 @@ impl<T> OptionalResult for Result<T, Error> {
 #[derive(Clone, Debug)]
 pub struct Client {
 	client: reqwest::Client,
-	command_send: mpsc::Sender<Command>,
+	command_send: Option<mpsc::Sender<Command>>,
 }
 
 impl Client {
-	pub fn new(token: &str, command_send: mpsc::Sender<Command>) -> Result<Self, Error> {
+	pub fn new(token: &str, command_send: Option<mpsc::Sender<Command>>) -> Result<Self, Error> {
 		let mut headers = header::HeaderMap::new();
 		headers.insert(
 			header::USER_AGENT,
@@ -162,6 +162,10 @@ impl Client {
 		})
 	}
 
+	fn command_send(&mut self) -> Result<&mut mpsc::Sender<Command>, ()> {
+		self.command_send.as_mut().ok_or(())
+	}
+
 	pub fn request_guild_members(&mut self, guild_id: GuildId) -> Result<(), ()> {
 		let req = RequestGuildMembers {
 			guild_id,
@@ -171,7 +175,8 @@ impl Client {
 			user_ids: HashSet::new(),
 			nonce: None,
 		};
-		self.command_send.try_send(req.into()).map_err(|_| ())
+
+		self.command_send()?.try_send(req.into()).map_err(|_| ())
 	}
 
 	pub fn update_voice_state(
@@ -187,7 +192,7 @@ impl Client {
 			self_mute,
 			self_deaf,
 		};
-		self.command_send.try_send(upd.into()).map_err(|_| ())
+		self.command_send()?.try_send(upd.into()).map_err(|_| ())
 	}
 
 	async fn get<D>(&self, url: &str) -> Result<D, Error>
@@ -292,6 +297,43 @@ impl Client {
 		Ok(())
 	}
 
+	pub async fn get_message(
+		&self,
+		channel_id: ChannelId,
+		message_id: MessageId,
+	) -> Result<Message, Error> {
+		self.get(&format!("channels/{}/messages/{}", channel_id, message_id))
+			.await
+	}
+
+	pub async fn get_reactions(
+		&self,
+		channel_id: ChannelId,
+		message_id: MessageId,
+		emoji: &PartialEmoji,
+		after: Option<UserId>,
+		limit: Option<u8>,
+	) -> Result<Vec<User>, Error> {
+		let name = emoji.name.as_deref().ok_or(Error::BadRequest)?;
+		let name = match emoji.id {
+			Some(id) => format!("{}:{}", name, id),
+			None => name.to_string(),
+		};
+		let name = urlencoding::encode(&name);
+		let limit = limit.unwrap_or(100).min(100);
+		let params = if let Some(user_id) = after {
+			format!("&after={}", user_id)
+		} else {
+			String::new()
+		};
+
+		self.get(&format!(
+			"channels/{}/messages/{}/reactions/{}?limit={}{}",
+			channel_id, message_id, name, limit, params
+		))
+		.await
+	}
+
 	pub fn create_message(&self, channel_id: ChannelId) -> CreateMessageBuilder<'_> {
 		CreateMessageBuilder {
 			client: &self,
@@ -371,6 +413,24 @@ impl Client {
 		component: bool,
 	) -> InteractionResponse<'a> {
 		InteractionResponse::new(self, interaction_id, token, component)
+	}
+
+	pub async fn get_guild_members(
+		&self,
+		guild_id: GuildId,
+		after: Option<UserId>,
+		limit: Option<u16>,
+	) -> Result<Vec<Member>, Error> {
+		let limit = limit.unwrap_or(1000).min(1000);
+		let param = match after {
+			Some(a) => format!("&after={}", a),
+			None => String::new(),
+		};
+		self.get(&format!(
+			"guilds/{}/members?limit={}{}",
+			guild_id, limit, param
+		))
+		.await
 	}
 
 	pub async fn get_guild_member(
@@ -666,7 +726,7 @@ impl ButtonComponent {
 		self
 	}
 
-	pub fn emoji<T: Into<ComponentEmoji>>(mut self, emoji: T) -> Self {
+	pub fn emoji<T: Into<PartialEmoji>>(mut self, emoji: T) -> Self {
 		self.component.emoji = Some(emoji.into());
 		self
 	}

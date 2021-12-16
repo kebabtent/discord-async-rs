@@ -90,7 +90,7 @@ where
 		let (command_send, command_recv) = mpsc::channel(8);
 		let (init_send, init_recv) = oneshot::channel();
 		let (shutdown_send, shutdown_recv) = oneshot::channel();
-		let client = Client::new(&self.token, command_send)?;
+		let client = Client::new(&self.token, Some(command_send))?;
 		let handle = task::spawn(start_discord(
 			self.token,
 			self.intents,
