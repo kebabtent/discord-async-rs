@@ -144,7 +144,7 @@ async fn write(
 	let mut timestamp = 0u32;
 	let mut buf = Vec::<u8>::with_capacity(512);
 	let mut nonce = [0u8; 24];
-	let mut packet = [0u8; 512];
+	let mut packet = [0u8; 2048];
 	packet[0] = 0x80;
 	packet[1] = 0x78;
 	(&mut packet[8..12]).write_u32::<BigEndian>(ssrc)?;
