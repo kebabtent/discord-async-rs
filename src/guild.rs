@@ -1,3 +1,4 @@
+#[cfg(feature = "voice")]
 use crate::voice;
 use crate::{Client, Error, GatewayEvent};
 use discord_types::event;
@@ -90,6 +91,7 @@ impl<S> Guild<S> {
 		self.available
 	}
 
+	#[cfg(feature = "voice")]
 	pub fn create_player(&self) -> (voice::Updater, voice::Controller, voice::Listener) {
 		let (player, updater, controller, listener) =
 			voice::Player::new(self.id, self.user_id, self.client.clone());
