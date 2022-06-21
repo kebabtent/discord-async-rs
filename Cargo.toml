@@ -6,7 +6,7 @@ description = "Asynchronous Rust library for the Discord API"
 license = "Apache-2.0"
 repository = "https://github.com/kebabtent/discord-async-rs"
 readme = "README.md"
-edition = "2018"
+edition = "2021"
 
 [features]
 sqlx = ["discord-types/sqlx"]
