@@ -558,8 +558,8 @@ impl<'a> CreateMessage<'a> {
 		self
 	}
 
-	pub fn component_row(mut self, row: RowComponent) -> Self {
-		self.cm.components.push(row.component);
+	pub fn component_row<T: Into<RowComponent>>(mut self, row: T) -> Self {
+		self.cm.components.push(row.into().component);
 		self
 	}
 
@@ -616,11 +616,11 @@ impl<'a> EditMessage<'a> {
 		self
 	}
 
-	pub fn component_row(mut self, row: RowComponent) -> Self {
+	pub fn component_row<T: Into<RowComponent>>(mut self, row: T) -> Self {
 		self.em
 			.components
 			.get_or_insert_with(|| Vec::new())
-			.push(row.component);
+			.push(row.into().component);
 		self
 	}
 
@@ -648,6 +648,8 @@ impl RowComponent {
 				disabled: None,
 				default: None,
 				components: Vec::with_capacity(5),
+				options: Vec::new(),
+				placeholder: None,
 			},
 		}
 	}
@@ -656,11 +658,22 @@ impl RowComponent {
 		self.component.components.push(button.component);
 		self
 	}
+
+	pub fn select_menu(mut self, menu: SelectMenuComponent) -> Self {
+		self.component.components.push(menu.component);
+		self
+	}
 }
 
 impl From<ButtonComponent> for RowComponent {
 	fn from(button: ButtonComponent) -> RowComponent {
 		RowComponent::new().button(button)
+	}
+}
+
+impl From<SelectMenuComponent> for RowComponent {
+	fn from(menu: SelectMenuComponent) -> RowComponent {
+		RowComponent::new().select_menu(menu)
 	}
 }
 
@@ -682,6 +695,8 @@ impl ButtonComponent {
 				disabled: None,
 				default: None,
 				components: Vec::new(),
+				options: Vec::new(),
+				placeholder: None,
 			},
 		}
 	}
@@ -729,6 +744,92 @@ impl ButtonComponent {
 	pub fn emoji<T: Into<PartialEmoji>>(mut self, emoji: T) -> Self {
 		self.component.emoji = Some(emoji.into());
 		self
+	}
+}
+
+#[derive(Clone)]
+pub struct SelectMenuComponent {
+	component: Component,
+}
+
+impl SelectMenuComponent {
+	pub fn new<T: Into<CowString>>(custom_id: T) -> Self {
+		Self {
+			component: Component {
+				component_type: ComponentType::SelectMenu,
+				style: None,
+				label: None,
+				emoji: None,
+				custom_id: Some(custom_id.into()),
+				url: None,
+				disabled: None,
+				default: None,
+				components: Vec::new(),
+				options: Vec::new(),
+				placeholder: None,
+			},
+		}
+	}
+
+	pub fn placeholder<T: Into<CowString>>(mut self, placeholder: T) -> Self {
+		self.component.placeholder = Some(placeholder.into());
+		self
+	}
+
+	pub fn option<T: Into<discord_types::SelectOption>>(mut self, option: T) -> Self {
+		self.component.options.push(option.into());
+		self
+	}
+
+	pub fn options<T: IntoIterator<Item = discord_types::SelectOption>>(
+		mut self,
+		options: T,
+	) -> Self {
+		self.component.options = options.into_iter().collect();
+		self
+	}
+}
+
+pub struct SelectOption {
+	option: discord_types::SelectOption,
+}
+
+impl SelectOption {
+	pub fn new<T, U>(label: T, value: U) -> Self
+	where
+		T: Into<CowString>,
+		U: Into<CowString>,
+	{
+		Self {
+			option: discord_types::SelectOption {
+				label: label.into(),
+				value: value.into(),
+				description: None,
+				emoji: None,
+				default: false,
+			},
+		}
+	}
+
+	pub fn description<T: Into<CowString>>(mut self, description: T) -> Self {
+		self.option.description = Some(description.into());
+		self
+	}
+
+	pub fn emoji<T: Into<PartialEmoji>>(mut self, emoji: T) -> Self {
+		self.option.emoji = Some(emoji.into());
+		self
+	}
+
+	pub fn default(mut self) -> Self {
+		self.option.default = true;
+		self
+	}
+}
+
+impl From<SelectOption> for discord_types::SelectOption {
+	fn from(option: SelectOption) -> discord_types::SelectOption {
+		option.option
 	}
 }
 
@@ -829,11 +930,11 @@ impl<'a> InteractionResponse<'a> {
 		self
 	}
 
-	pub fn component_row(mut self, row: RowComponent) -> Self {
+	pub fn component_row<T: Into<RowComponent>>(mut self, row: T) -> Self {
 		self.data()
 			.components
 			.get_or_insert_with(|| Vec::new())
-			.push(row.component);
+			.push(row.into().component);
 		self
 	}
 

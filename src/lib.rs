@@ -1,5 +1,6 @@
 pub use crate::client::{
 	ButtonComponent, Client, Error as ClientError, OptionalResult, RowComponent,
+	SelectMenuComponent, SelectOption,
 };
 pub use crate::discord::{Builder, Discord};
 pub use crate::gateway::{Connector, Error as GatewayError, Gateway, GatewayEvent};

@@ -82,7 +82,8 @@ where
 		Self {
 			token,
 			callback,
-			intents: Intents::GUILD_ALL ^ Intents::GUILD_WEBHOOKS ^ Intents::GUILD_MESSAGE_TYPING,
+			intents: Intents::GUILD_ALL ^ Intents::GUILD_WEBHOOKS ^ Intents::GUILD_MESSAGE_TYPING
+				| Intents::MESSAGE_CONTENT,
 		}
 	}
 

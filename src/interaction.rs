@@ -79,8 +79,8 @@ impl ResponseBuilder {
 		self
 	}
 
-	pub fn component_row(mut self, row: RowComponent) -> Self {
-		self.rows.get_or_insert_with(|| Vec::new()).push(row);
+	pub fn component_row<T: Into<RowComponent>>(mut self, row: T) -> Self {
+		self.rows.get_or_insert_with(|| Vec::new()).push(row.into());
 		self
 	}
 

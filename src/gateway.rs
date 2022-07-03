@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-const API_VERSION: u8 = 8;
+const API_VERSION: u8 = 10;
 
 #[derive(Debug)]
 pub enum Error {
