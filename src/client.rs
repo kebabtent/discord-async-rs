@@ -771,6 +771,11 @@ impl SelectMenuComponent {
 		}
 	}
 
+	pub fn disabled(mut self) -> Self {
+		self.component.disabled = Some(true);
+		self
+	}
+
 	pub fn placeholder<T: Into<CowString>>(mut self, placeholder: T) -> Self {
 		self.component.placeholder = Some(placeholder.into());
 		self
