@@ -12,8 +12,8 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 use xsalsa20poly1305::aead::generic_array::GenericArray;
-use xsalsa20poly1305::aead::{AeadInPlace, NewAead};
-use xsalsa20poly1305::XSalsa20Poly1305;
+use xsalsa20poly1305::aead::AeadInPlace;
+use xsalsa20poly1305::{KeyInit, XSalsa20Poly1305};
 
 pub type Listener = mpsc::Receiver<Event>;
 pub type KeySender = oneshot::Sender<SecretKey>;
