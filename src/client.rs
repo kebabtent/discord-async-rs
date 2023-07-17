@@ -756,7 +756,7 @@ impl SelectMenuComponent {
 	pub fn new<T: Into<CowString>>(custom_id: T) -> Self {
 		Self {
 			component: Component {
-				component_type: ComponentType::SelectMenu,
+				component_type: ComponentType::StringSelect,
 				style: None,
 				label: None,
 				emoji: None,
