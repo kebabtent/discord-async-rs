@@ -345,7 +345,7 @@ dependencies = [
 [[package]]
 name = "discord-types"
 version = "0.1.0"
-source = "git+https://github.com/kebabtent/discord-types-rs#5f5043f5480f0c389ff32babd07abca7ee8d26eb"
+source = "git+https://github.com/kebabtent/discord-types-rs#01925dea2e98c36b1a045297a1a3bff51fd3d771"
 dependencies = [
  "bitflags 2.1.0",
  "chrono",
